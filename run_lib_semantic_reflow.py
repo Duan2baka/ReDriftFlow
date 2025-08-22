@@ -1,6 +1,7 @@
 import torch
 import numpy as np
 import os
+import json
 import logging
 from tqdm import tqdm
 from typing import Optional, Tuple
@@ -772,229 +773,24 @@ def generate_semantic_data_pairs(config,
         pickle.dump(file_index, f)
     
     logging.info(f"Saved batch files index to {file_index_path}")
-    
-    # Load and combine all data for boundary training (load in chunks to manage memory)
-    logging.info("Loading data for boundary training...")
-    all_noise = []
-    all_images = []
-    
-    chunk_size = 5  # Process 5 batches at a time to manage memory
-    for chunk_start in tqdm(range(0, len(all_noise_files), chunk_size), desc="Loading data chunks"):
-        chunk_end = min(chunk_start + chunk_size, len(all_noise_files))
-        
-        chunk_noise = []
-        chunk_images = []
-        
-        for idx in range(chunk_start, chunk_end):
-            noise_data = torch.load(all_noise_files[idx], map_location='cpu')
-            images_data = torch.load(all_images_files[idx], map_location='cpu')
-            
-            chunk_noise.append(noise_data.numpy())
-            chunk_images.append(images_data.numpy())
-        
-        all_noise.extend(chunk_noise)
-        all_images.extend(chunk_images)
-        
-        # Clear chunk data
-        del chunk_noise, chunk_images
-    
-    # Convert to numpy arrays
-    all_noise = np.concatenate(all_noise, axis=0)
-    all_images = np.concatenate(all_images, axis=0)
-    all_labels = np.array(all_labels)
-    
-    # Save complete classification results
-    complete_classification_path = os.path.join(classification_dir, 'complete_classifications.pkl')
-    complete_classification_data = {
-        'all_noise': all_noise,
-        'all_images': all_images,
-        'all_labels': all_labels,
-        'num_positive': np.sum(all_labels == 1),
-        'num_negative': np.sum(all_labels == 0),
-        'total_samples': len(all_labels)
-    }
-    
-    with open(complete_classification_path, 'wb') as f:
-        pickle.dump(complete_classification_data, f)
-    
-    logging.info(f"Saved complete classification results to {complete_classification_path}")
-    logging.info(f"Classification statistics: {np.sum(all_labels == 1)} positive, {np.sum(all_labels == 0)} negative")
     logging.info(f"Classification completed: {positive_count} positive samples, {negative_count} negative samples")
     
-    # Create final classification summary grids
-    positive_indices = np.where(all_labels == 1)[0]
-    negative_indices = np.where(all_labels == 0)[0]
-    
-    if len(positive_indices) > 0:
-        # Create final positive grid
-        pos_sample_indices = positive_indices[np.random.choice(len(positive_indices), 
-                                                             min(64, len(positive_indices)), 
-                                                             replace=False)]
-        pos_samples = torch.stack([torch.from_numpy(all_images[i]) for i in pos_sample_indices])
-        final_pos_grid_path = os.path.join(classified_images_dir, 'final_positive_samples_grid.png')
-        create_image_grid(pos_samples, nrow=8, save_path=final_pos_grid_path)
-        logging.info(f"Saved final positive samples grid to {final_pos_grid_path}")
-    
-    if len(negative_indices) > 0:
-        # Create final negative grid
-        neg_sample_indices = negative_indices[np.random.choice(len(negative_indices), 
-                                                             min(64, len(negative_indices)), 
-                                                             replace=False)]
-        neg_samples = torch.stack([torch.from_numpy(all_images[i]) for i in neg_sample_indices])
-        final_neg_grid_path = os.path.join(classified_images_dir, 'final_negative_samples_grid.png')
-        create_image_grid(neg_samples, nrow=8, save_path=final_neg_grid_path)
-        logging.info(f"Saved final negative samples grid to {final_neg_grid_path}")
-    
-    # Train semantic boundary in u-space at t=0.5
-    logging.info("Training semantic boundary in u-space...")
-    
-    # Extract u-space representations at t=0.5
-    checkpoint_path = config.reflow.last_flow_ckpt
-    score_model, inverse_scaler = load_model_and_config(config, checkpoint_path)
-    
-    sde = sde_lib.RectifiedFlow(
-        init_type=config.sampling.init_type,
-        noise_scale=config.sampling.init_noise_scale,
-        use_ode_sampler=config.sampling.use_ode_sampler,
-        sigma_var=getattr(config.sampling, 'sigma_variance', 0.0),
-        ode_tol=getattr(config.sampling, 'ode_tol', 1e-5),
-        sample_N=getattr(config.sampling, 'sample_N', 50)
-    )
-    
-    # Extract u-space representations from subset
-    subset_size = min(1000, len(all_noise))
-    subset_indices = np.random.choice(len(all_noise), subset_size, replace=False)
-    u_space_data = []
-    u_space_labels = []
-    
-    for i in tqdm(range(0, subset_size, 16), desc="Extracting u-space"):
-        end_idx = min(i + 16, subset_size)
-        batch_indices = subset_indices[i:end_idx]
-        
-        noise_batch = torch.stack([torch.from_numpy(all_noise[idx]) for idx in batch_indices]).to(config.device)
-        labels_batch = [all_labels[idx] for idx in batch_indices]
-        
-        # Forward to t=0.25 to get u-space representation
-        with torch.no_grad():
-            u_rep = noise_batch.clone()
-            steps_to_control = config.sampling.sample_N - config.sampling.sample_N // 4  # Go to t=0.25
-            dt = -0.75 / steps_to_control  # from t=1 to t=0.25
-            
-            for step in range(steps_to_control):
-                t = torch.ones(noise_batch.shape[0], device=config.device) * (1.0 - (step + 1) * 0.75 / steps_to_control)
-                score = score_model(u_rep, t)
-                u_rep = u_rep + dt * score
-        
-        u_flat = u_rep.cpu().numpy().reshape(u_rep.shape[0], -1)
-        u_space_data.append(u_flat)
-        u_space_labels.extend(labels_batch)
-        
-        del noise_batch, u_rep
-        torch.cuda.empty_cache()
-    
-    u_space_data = np.concatenate(u_space_data, axis=0)
-    u_space_labels = np.array(u_space_labels)
-    
-    # Train boundary in u-space
-    boundary, svm_accuracy = semantic_trainer.train_boundary(
-        noise_vectors=u_space_data,
-        labels=u_space_labels,
-        save_path=os.path.join(boundary_dir, 'semantic_boundary.pkl')
-    )
-    
-    # Log classification results with SVM accuracy to WandB
-    log_classification_results(all_labels, boundary_accuracy=svm_accuracy)
-    
-    # Save boundary training details
-    boundary_details_path = os.path.join(boundary_dir, 'boundary_training_details.pkl')
-    boundary_details = {
-        'boundary_vector': boundary,
-        'svm_accuracy': svm_accuracy,
-        'training_samples': len(all_labels),
-        'positive_samples': np.sum(all_labels == 1),
-        'negative_samples': np.sum(all_labels == 0),
-        'boundary_norm': np.linalg.norm(boundary) if boundary is not None else None
+    # Save classification summary without loading all data
+    classification_summary = {
+        'num_positive': positive_count,
+        'num_negative': negative_count,
+        'total_samples': positive_count + negative_count,
+        'file_index_path': file_index_path
     }
     
-    with open(boundary_details_path, 'wb') as f:
-        pickle.dump(boundary_details, f)
+    summary_path = os.path.join(classification_dir, 'classification_summary.json')
+    with open(summary_path, 'w') as f:
+        json.dump(classification_summary, f, indent=2)
     
-    logging.info(f"Saved boundary training details to {boundary_details_path}")
+    logging.info(f"Saved classification summary to {summary_path}")
     
-    # Log boundary training results to WandB
-    log_boundary_training_results(boundary_details)
-    
-    # STEP 4.5: Train reflow with u-space drift modification
-    if boundary is not None:
-        logging.info("STEP 4.5: Training reflow with u-space drift at t=0.25...")
-        
-        # Train reflow with u-space drift (不需要生成controlled trajectories)
-        # 直接在训练时修改 zt' = zt + k*v，损失还是对原始z1
-        training_checkpoint_dir = train_reflow_with_uspace_drift(
-            config, workdir, all_noise, all_images, all_labels, boundary
-        )
-        
-        logging.info(f"U-space drift reflow training completed! Checkpoints: {training_checkpoint_dir}")
-        
-        # Update config to use the newly trained model for variations
-        latest_checkpoint = os.path.join(training_checkpoint_dir, 'checkpoint.pth')
-        if os.path.exists(latest_checkpoint):
-            config.reflow.last_flow_ckpt = latest_checkpoint
-            logging.info(f"Updated config to use newly trained model: {latest_checkpoint}")
-    
-    # Log semantic variations if boundary was successfully trained
-    if boundary is not None:
-        logging.info("Generating semantic variations for WandB logging...")
-        
-        # Set variations directory in config
-        config.semantic_variations_dir = workdir
-        
-        # Reload model for semantic variations (use newly trained model if available)
-        checkpoint_path = config.reflow.last_flow_ckpt
-        score_model, inverse_scaler = load_model_and_config(config, checkpoint_path)
-        
-        # Initialize SDE
-        sde = sde_lib.RectifiedFlow(
-            init_type=config.sampling.init_type,
-            noise_scale=config.sampling.init_noise_scale,
-            use_ode_sampler=config.sampling.use_ode_sampler,
-            sigma_var=getattr(config.sampling, 'sigma_variance', 0.0),
-            ode_tol=getattr(config.sampling, 'ode_tol', 1e-5),
-            sample_N=getattr(config.sampling, 'sample_N', 50)
-        )
-        
-        # Log semantic variations (reuse already loaded model)
-        log_semantic_variations(sde, score_model, inverse_scaler, config, 
-                               None, all_noise, boundary, num_examples=5)
-    
-    # Save enhanced data with semantic information
-    semantic_data_path = os.path.join(workdir, 'semantic_data_pairs.pkl')
-    semantic_data = {
-        'z0': all_noise,
-        'z1': all_images,
-        'labels': all_labels,
-        'boundary': boundary,
-        'config': config,
-        'metadata': {
-            'num_samples': len(all_labels),
-            'positive_ratio': np.sum(all_labels == 1) / len(all_labels),
-            'classification_dir': classification_dir,
-            'boundary_dir': boundary_dir
-        }
-    }
-    
-    with open(semantic_data_path, 'wb') as f:
-        pickle.dump(semantic_data, f)
-    
-    logging.info(f"Semantic data pairs saved to {semantic_data_path}")
-    logging.info(f"Semantic boundary saved to {os.path.join(boundary_dir, 'semantic_boundary.pkl')}")
-    
-    # Clean up memory before returning
-    del all_noise, all_images, all_labels
-    del z0_tensor, z1_tensor
-    torch.cuda.empty_cache()
-    
-    return semantic_data_path
+    return classification_dir
+
 
 def continue_semantic_classification(config, workdir: str, interfacegan_model_path: str, 
                                    existing_data_path: str) -> str:

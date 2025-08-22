@@ -193,7 +193,7 @@ def run_single_iteration(config, workdir, iteration, base_model_path):
         'metadata_path': metadata_path
     }
 
-def run_iterative_training_pipeline(config_path, workdir, num_iterations=2, initial_model=None):
+def run_iterative_training_pipeline(config_path, workdir, num_iterations=2, initial_model=None, resume_from=None):
     """Run the complete iterative training pipeline"""
     
     # Load configuration
@@ -212,17 +212,67 @@ def run_iterative_training_pipeline(config_path, workdir, num_iterations=2, init
     logging.info(f"Working directory: {workdir}")
     logging.info(f"Number of iterations: {num_iterations}")
     
+    # Check for existing results and determine resume point
+    results_path = os.path.join(workdir, 'final_results.json')
+    existing_results = []
+    start_iteration = 1
+    current_model_path = initial_model
+    
+    if resume_from:
+        start_iteration = resume_from
+        logging.info(f"Resuming from iteration {resume_from}")
+        
+        # Try to load existing results
+        if os.path.exists(results_path):
+            try:
+                with open(results_path, 'r') as f:
+                    existing_data = json.load(f)
+                    existing_results = existing_data.get('iterations', [])
+                    
+                # Find the last completed iteration before resume point
+                last_completed = None
+                for result in existing_results:
+                    if result.get('iteration_dir', '').endswith(f'iteration_{resume_from - 1}'):
+                        last_completed = result
+                        break
+                
+                if last_completed and os.path.exists(last_completed['model_path']):
+                    current_model_path = last_completed['model_path']
+                    logging.info(f"Found previous model: {current_model_path}")
+                else:
+                    logging.warning(f"Could not find model from iteration {resume_from - 1}, using initial model")
+            except Exception as e:
+                logging.warning(f"Could not load existing results: {e}")
+    else:
+        # Auto-detect resume point
+        iteration_dirs = [d for d in os.listdir(workdir) if d.startswith('iteration_') and os.path.isdir(os.path.join(workdir, d))]
+        if iteration_dirs:
+            completed_iterations = []
+            for d in iteration_dirs:
+                try:
+                    iter_num = int(d.split('_')[1])
+                    metadata_path = os.path.join(workdir, d, 'metadata.json')
+                    if os.path.exists(metadata_path):
+                        with open(metadata_path, 'r') as f:
+                            metadata = json.load(f)
+                            if os.path.exists(metadata['model_path']):
+                                completed_iterations.append((iter_num, metadata['model_path']))
+                except:
+                    continue
+            
+            if completed_iterations:
+                completed_iterations.sort()
+                last_iter, last_model = completed_iterations[-1]
+                start_iteration = last_iter + 1
+                current_model_path = last_model
+                logging.info(f"Auto-resuming from iteration {start_iteration} with model: {current_model_path}")
+    
     # Validate configuration
     if not validate_paths(config):
         logging.error("Configuration validation failed")
         return None
     
-    # Setup WandB
-    experiment_name = f"semantic_reflow_iterative_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    wandb_run = setup_wandb(config, workdir, experiment_name)
-    
-    # Use initial model or config checkpoint
-    current_model_path = initial_model
+    # Use initial model or config checkpoint if no resume model found
     if not current_model_path and hasattr(config, 'reflow') and hasattr(config.reflow, 'last_flow_ckpt'):
         current_model_path = config.reflow.last_flow_ckpt
     
@@ -234,13 +284,20 @@ def run_iterative_training_pipeline(config_path, workdir, num_iterations=2, init
         logging.error(f"Initial model file does not exist: {current_model_path}")
         return None
     
-    logging.info(f"Using initial model: {current_model_path}")
+    logging.info(f"Using model: {current_model_path}")
     
-    results = []
+    # Setup WandB
+    experiment_name = f"semantic_reflow_iterative_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    if start_iteration > 1:
+        experiment_name += f"_resume_{start_iteration}"
+    wandb_run = setup_wandb(config, workdir, experiment_name)
+    
+    results = existing_results.copy()
     
     # Run iterations
-    for iteration in range(1, num_iterations + 1):
+    for iteration in range(start_iteration, num_iterations + 1):
         try:
+            logging.info(f"Running iteration {iteration}/{num_iterations}")
             iteration_result = run_single_iteration(
                 config=config,
                 workdir=workdir,
@@ -253,7 +310,19 @@ def run_iterative_training_pipeline(config_path, workdir, num_iterations=2, init
             # Update current model for next iteration
             current_model_path = iteration_result['model_path']
             
-            logging.info(f"Iteration {iteration}/{num_iterations} completed")
+            # Save progress after each iteration
+            progress_results = {
+                'num_iterations_completed': len([r for r in results if 'model_path' in r]),
+                'current_model_path': current_model_path,
+                'iterations': results,
+                'experiment_name': experiment_name,
+                'last_completed_iteration': iteration
+            }
+            
+            with open(results_path, 'w') as f:
+                json.dump(progress_results, f, indent=2)
+                
+            logging.info(f"Iteration {iteration}/{num_iterations} completed, progress saved")
             
         except Exception as e:
             logging.error(f"Error in iteration {iteration}: {str(e)}")
@@ -261,13 +330,12 @@ def run_iterative_training_pipeline(config_path, workdir, num_iterations=2, init
     
     # Save final results
     final_results = {
-        'num_iterations_completed': len(results),
+        'num_iterations_completed': len([r for r in results if 'model_path' in r]),
         'final_model_path': current_model_path,
         'iterations': results,
         'experiment_name': experiment_name
     }
     
-    results_path = os.path.join(workdir, 'final_results.json')
     with open(results_path, 'w') as f:
         json.dump(final_results, f, indent=2)
     
@@ -288,6 +356,7 @@ def main():
     parser.add_argument('--workdir', required=True, help='Working directory for training')
     parser.add_argument('--iterations', type=int, default=2, help='Number of iterations')
     parser.add_argument('--initial_model', help='Path to initial model (optional)')
+    parser.add_argument('--resume_from', type=int, help='Resume from specific iteration (optional)')
     
     args = parser.parse_args()
     
@@ -296,7 +365,8 @@ def main():
         config_path=args.config,
         workdir=args.workdir,
         num_iterations=args.iterations,
-        initial_model=args.initial_model
+        initial_model=args.initial_model,
+        resume_from=args.resume_from
     )
     
     if results:
