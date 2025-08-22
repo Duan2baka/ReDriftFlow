@@ -1,0 +1,8 @@
+scikit-learn>=1.0.0
+ml-collections
+tqdm
+torchvision
+wandb
+matplotlib
+pillow
+thundersvm
