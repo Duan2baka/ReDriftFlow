@@ -26,4 +26,4 @@ def save_checkpoint(ckpt_dir, state):
     'ema': state['ema'].state_dict(),
     'step': state['step']
   }
-  torch.save(saved_state, ckpt_dir)
+  torch.save(saved_state, ckpt_dir, pickle_protocol=4)

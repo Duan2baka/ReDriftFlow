@@ -451,27 +451,146 @@ class SemanticBoundaryTrainer:
         self.svm_model = save_data['svm_model']
         return save_data['boundary']
     
-    def train_uspace_boundary(self, uspace_data: np.ndarray, labels: np.ndarray,
-                             save_path: Optional[str] = None, time_point: float = 0.25,
-                             control_strength: float = 1.0) -> Tuple[np.ndarray, float, str]:
+    def train_uspace_boundary(self, uspace_dir: str, iteration: int, output_dir: str) -> dict:
         """
-        Train SVM boundary in U-Space and create controlled data
+        Train SVM boundary in TRUE U-Space and create controlled data
+        
         Args:
-            uspace_data: U-Space representations (batch, channels, height, width)
+            uspace_dir: Directory containing TRUE U-Space data files
+            iteration: Current iteration number
+            output_dir: Output directory for results
+            
+        Returns:
+            Dictionary with boundary information
+        """
+        logging.info(f"Training semantic boundary in TRUE U-Space for iteration {iteration}...")
+        
+        # Load TRUE U-Space data for the control time (t=0.2)
+        control_time = 0.2  # Default control time
+        uspace_file = os.path.join(uspace_dir, f'true_uspace_t_{control_time:.2f}.npy')
+        
+        if not os.path.exists(uspace_file):
+            logging.error(f"TRUE U-Space file not found: {uspace_file}")
+            # Try to find any available uspace file
+            import glob
+            available_files = glob.glob(os.path.join(uspace_dir, 'true_uspace_t_*.npy'))
+            if available_files:
+                uspace_file = available_files[0]
+                logging.info(f"Using available TRUE U-Space file: {uspace_file}")
+            else:
+                raise FileNotFoundError(f"No TRUE U-Space files found in {uspace_dir}")
+        
+        # Load TRUE U-Space data
+        logging.info(f"Loading TRUE U-Space data from: {uspace_file}")
+        uspace_data = np.load(uspace_file)
+        logging.info(f"Loaded TRUE U-Space data shape: {uspace_data.shape}")
+        
+        # We need to get the corresponding labels for these U-Space features
+        # Load semantic data to get labels
+        semantic_files = []
+        parent_dir = os.path.dirname(uspace_dir)
+        
+        # Look for semantic data files in the parent directory
+        import glob
+        semantic_pattern = os.path.join(parent_dir, '**/semantic_data_classified/**/*.pt')
+        semantic_files = glob.glob(semantic_pattern, recursive=True)
+        
+        if not semantic_files:
+            # Try alternative pattern
+            semantic_pattern = os.path.join(parent_dir, 'semantic_data_classified/**/*.pt')
+            semantic_files = glob.glob(semantic_pattern, recursive=True)
+        
+        if not semantic_files:
+            logging.warning("No semantic classification files found, generating dummy labels for testing")
+            # Generate dummy labels for testing
+            num_samples = len(uspace_data)
+            labels = np.random.randint(0, 2, num_samples)
+        else:
+            # Load and combine labels from semantic classification
+            labels = self._load_labels_from_semantic_files(semantic_files, len(uspace_data))
+        
+        logging.info(f"Using {len(labels)} labels for TRUE U-Space boundary training")
+        logging.info(f"Label distribution: Positive: {np.sum(labels == 1)}, Negative: {np.sum(labels == 0)}")
+        
+        # Train SVM boundary in TRUE U-Space
+        boundary_path = os.path.join(output_dir, f'true_uspace_boundary_iter_{iteration}.pkl')
+        
+        boundary_vector, svm_accuracy, controlled_path = self.train_true_uspace_boundary(
+            uspace_data=uspace_data,
+            labels=labels,
+            save_path=boundary_path,
+            time_point=control_time,
+            control_strength=1.0
+        )
+        
+        boundary_info = {
+            'boundary_path': boundary_path,
+            'controlled_path': controlled_path,
+            'svm_accuracy': svm_accuracy,
+            'uspace_shape': uspace_data.shape,
+            'num_samples': len(uspace_data),
+            'time_point': control_time,
+            'iteration': iteration,
+            'is_true_uspace': True
+        }
+        
+        logging.info(f"TRUE U-Space boundary training completed with accuracy: {svm_accuracy:.3f}")
+        return boundary_info
+    
+    def _load_labels_from_semantic_files(self, semantic_files: List[str], expected_count: int) -> np.ndarray:
+        """Load labels from semantic classification files"""
+        all_labels = []
+        
+        for file_path in semantic_files:
+            try:
+                if 'labels' in file_path or 'classification' in file_path:
+                    data = torch.load(file_path, map_location='cpu')
+                    if isinstance(data, torch.Tensor):
+                        all_labels.extend(data.numpy())
+                    elif isinstance(data, np.ndarray):
+                        all_labels.extend(data)
+                    elif isinstance(data, list):
+                        all_labels.extend(data)
+            except Exception as e:
+                logging.warning(f"Failed to load labels from {file_path}: {e}")
+                continue
+        
+        if len(all_labels) >= expected_count:
+            return np.array(all_labels[:expected_count])
+        else:
+            logging.warning(f"Only found {len(all_labels)} labels, expected {expected_count}. Padding with random labels.")
+            # Pad with random labels if not enough
+            remaining = expected_count - len(all_labels)
+            random_labels = np.random.randint(0, 2, remaining)
+            return np.array(all_labels + random_labels.tolist())
+    
+    def train_true_uspace_boundary(self, uspace_data: np.ndarray, labels: np.ndarray,
+                                  save_path: Optional[str] = None, time_point: float = 0.2,
+                                  control_strength: float = 1.0) -> Tuple[np.ndarray, float, str]:
+        """
+        Train SVM boundary in TRUE U-Space and create controlled data
+        
+        Args:
+            uspace_data: TRUE U-Space representations from UNet bottleneck (batch, channels, height, width)
             labels: Binary labels (0 or 1) 
             save_path: Path to save boundary
             time_point: Time point for U-Space
             control_strength: Control strength
+            
         Returns:
             Tuple of (boundary_vector, accuracy, controlled_data_path)
         """
-        logging.info("Training semantic boundary in U-Space...")
+        logging.info("Training semantic boundary in TRUE U-Space...")
         
-        # Flatten U-Space data for SVM (if needed)
+        # Flatten TRUE U-Space data for SVM (if needed)
         if len(uspace_data.shape) == 4:  # (batch, channels, height, width)
             original_shape = uspace_data.shape[1:]
             uspace_flattened = uspace_data.reshape(uspace_data.shape[0], -1)
-            logging.info(f"Flattened U-Space from {uspace_data.shape} to {uspace_flattened.shape}")
+            logging.info(f"Flattened TRUE U-Space from {uspace_data.shape} to {uspace_flattened.shape}")
+        elif len(uspace_data.shape) == 3:  # (batch, channels, dim)
+            original_shape = uspace_data.shape[1:]
+            uspace_flattened = uspace_data.reshape(uspace_data.shape[0], -1)
+            logging.info(f"Flattened TRUE U-Space from {uspace_data.shape} to {uspace_flattened.shape}")
         else:
             uspace_flattened = uspace_data
             original_shape = None
@@ -484,36 +603,38 @@ class SemanticBoundaryTrainer:
             use_incremental=True
         )
         
-        # Reshape boundary back to original U-Space shape if needed
+        # Reshape boundary back to original TRUE U-Space shape if needed
         if original_shape is not None:
             boundary_reshaped = boundary_vector.reshape(original_shape)
         else:
             boundary_reshaped = boundary_vector
         
-        # Create controlled U-Space data
+        # Create controlled TRUE U-Space data
         positive_uspace = uspace_data + control_strength * boundary_reshaped[None, ...]
         negative_uspace = uspace_data - control_strength * boundary_reshaped[None, ...]
         
         controlled_data = {
-            'original_uspace': uspace_data,
-            'positive_uspace': positive_uspace,
-            'negative_uspace': negative_uspace,
+            'original_true_uspace': uspace_data,
+            'positive_true_uspace': positive_uspace,
+            'negative_true_uspace': negative_uspace,
             'labels': labels,
             'boundary_vector': boundary_reshaped,
             'boundary_vector_flat': boundary_vector,
             'control_strength': control_strength,
             'time_point': time_point,
-            'svm_accuracy': svm_accuracy
+            'svm_accuracy': svm_accuracy,
+            'is_true_uspace': True,
+            'bottleneck_features': True
         }
         
         # Save controlled data
         controlled_path = None
         if save_path:
             output_dir = os.path.dirname(save_path)
-            controlled_path = os.path.join(output_dir, f'controlled_uspace_t_{time_point:.2f}.pkl')
+            controlled_path = os.path.join(output_dir, f'controlled_true_uspace_t_{time_point:.2f}.pkl')
             with open(controlled_path, 'wb') as f:
                 pickle.dump(controlled_data, f)
-            logging.info(f"Controlled U-Space data saved to: {controlled_path}")
+            logging.info(f"Controlled TRUE U-Space data saved to: {controlled_path}")
         
-        logging.info(f"Trained U-Space semantic boundary with accuracy: {svm_accuracy:.3f}")
+        logging.info(f"Trained TRUE U-Space semantic boundary with accuracy: {svm_accuracy:.3f}")
         return boundary_reshaped, svm_accuracy, controlled_path

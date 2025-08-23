@@ -128,18 +128,25 @@ def run_single_iteration(config, workdir, iteration, base_model_path):
         num_samples=num_samples
     )
     
-    # Step 2: Extract U-Space representations at t=0.2 (using neural ODE)
-    logging.info("Step 2: Extracting U-Space representations...")
+    # Validate semantic data path
+    logging.info(f"Generated semantic data path: {semantic_data_path}")
+    if not os.path.exists(semantic_data_path):
+        raise FileNotFoundError(f"Semantic data file not found: {semantic_data_path}")
+    if not (semantic_data_path.endswith('.pt') or semantic_data_path.endswith('.pkl')):
+        raise ValueError(f"Semantic data file must be .pt or .pkl format, got: {semantic_data_path}")
+    
+    # Step 2: Extract U-Space representations at t=0.2 (using TRUE U-Space from UNet bottleneck)
+    logging.info("Step 2: Extracting TRUE U-Space representations from UNet bottleneck...")
     control_time = getattr(config, 'semantic', {}).get('control_time', 0.2)
     uspace_extractor = USpaceExtractor(config, control_time=control_time)
     
-    # Process data pairs to extract U-Space using neural ODE
+    # Process data pairs to extract TRUE U-Space using UNet bottleneck features
     workdir_parent = os.path.dirname(iteration_dir)
     combined_file = uspace_extractor.process_existing_data_pairs(
         data_path=semantic_data_path,
         output_dir=workdir_parent,
         time_points=[control_time],
-        method='neural_ode',
+        method='true_uspace',
         checkpoint_path=base_model_path,
         iteration=iteration
     )
@@ -147,9 +154,12 @@ def run_single_iteration(config, workdir, iteration, base_model_path):
     uspace_dir = os.path.join(iteration_dir, 'uspace_extracted')
     logging.info(f"U-Space extraction completed, results in: {uspace_dir}")
     
-    # Step 3: Train semantic boundary in U-Space using SVM
-    logging.info("Step 3: Training semantic boundary in U-Space...")
-    boundary_trainer = SemanticBoundaryTrainer(config)
+    # Step 3: Train semantic boundary in TRUE U-Space using SVM
+    logging.info("Step 3: Training semantic boundary in TRUE U-Space...")
+    boundary_trainer = SemanticBoundaryTrainer(
+        interfacegan_model_path=getattr(config.semantic, 'interfacegan_model_path', ''),
+        device=str(config.device)
+    )
     
     boundary_info = boundary_trainer.train_uspace_boundary(
         uspace_dir=uspace_dir,

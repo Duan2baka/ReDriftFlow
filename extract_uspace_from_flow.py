@@ -49,11 +49,11 @@ except ImportError as e:
 
 class USpaceExtractor:
     """
-    Extract u-space representations at specific time t during flow matching process
+    Extract TRUE U-Space representations from UNet bottleneck features during flow matching
     
-    Given (z0, z1) pairs, extract xt at specific time t in the flow:
-    - Forward process: z0 → zt (at time t) → z1
-    - zt represents the u-space at time t
+    Given (z0, z1) pairs, extract UNet bottleneck features at interpolated points:
+    - Interpolation: xt = (1-t) * z0 + t * z1
+    - Extract bottleneck features from UNet as TRUE U-Space
     """
     
     def __init__(self, config, control_time: float = 0.25):
@@ -127,18 +127,21 @@ class USpaceExtractor:
         logging.info(f"Model loaded successfully! Training step: {state['step']}")
         logging.info(f"Model moved to device: {self.device}")
         
-    def extract_xt_with_neural_ode(self, z0_data: np.ndarray, control_time: float,
-                                   batch_size: int = 1, save_interval: int = 100,
-                                   temp_save_dir: str = None, 
-                                   return_path: bool = False) -> np.ndarray:
+    def extract_true_uspace_from_unet(self, z0_data: np.ndarray, z1_data: np.ndarray, control_time: float,
+                                     batch_size: int = 1, save_interval: int = 100,
+                                     temp_save_dir: str = None, 
+                                     return_path: bool = False) -> np.ndarray:
         """
-        Extract xt at specific time t using neural ODE integration
+        Extract TRUE U-Space representations from UNet bottleneck features
         
-        This method uses the trained score model to integrate from z0 to xt
-        More accurate but computationally expensive
+        Process:
+        1. Interpolate: xt = (1-t) * z0 + t * z1
+        2. Forward through UNet encoder to bottleneck
+        3. Extract bottleneck features as true U-Space
         
         Args:
             z0_data: noise vectors (batch, channels, height, width)
+            z1_data: target images (batch, channels, height, width)
             control_time: time t for extraction (0.0 to 1.0)
             batch_size: batch size for processing (reduced for memory safety)
             save_interval: save intermediate results every N batches
@@ -146,9 +149,9 @@ class USpaceExtractor:
             return_path: if True, return file path instead of loading data to memory
             
         Returns:
-            xt_data: u-space representations at time t (or file path if return_path=True)
+            uspace_data: TRUE U-Space features from UNet bottleneck (or file path if return_path=True)
         """
-        logging.info(f"Extracting xt at t={control_time} using neural ODE integration...")
+        logging.info(f"Extracting TRUE U-Space at t={control_time} from UNet bottleneck features...")
         logging.info(f"Using batch size: {batch_size}, save interval: {save_interval}")
         
         if self.score_model is None:
@@ -160,34 +163,45 @@ class USpaceExtractor:
         else:
             z0_tensor = z0_data
             
+        if isinstance(z1_data, np.ndarray):
+            z1_tensor = torch.from_numpy(z1_data)
+        else:
+            z1_tensor = z1_data
+            
         num_samples = len(z0_tensor)
         num_batches = (num_samples + batch_size - 1) // batch_size
         
         # Create temporary save directory if not provided
         if temp_save_dir is None:
-            temp_save_dir = f"temp_uspace_t_{control_time:.2f}"
+            temp_save_dir = f"temp_true_uspace_t_{control_time:.2f}"
         os.makedirs(temp_save_dir, exist_ok=True)
         
-        all_xt = []
+        all_uspace = []
         temp_file_counter = 0
         
         # Clear GPU cache before starting
         torch.cuda.empty_cache()
         
-        for batch_idx in tqdm(range(num_batches), desc="Extracting xt with neural ODE"):
+        for batch_idx in tqdm(range(num_batches), desc="Extracting TRUE U-Space from UNet bottleneck"):
             start_idx = batch_idx * batch_size
             end_idx = min(start_idx + batch_size, num_samples)
             z0_batch = z0_tensor[start_idx:end_idx].to(self.device)
+            z1_batch = z1_tensor[start_idx:end_idx].to(self.device)
             
             try:
                 with torch.no_grad():
-                    # Integrate from t=0 to t=control_time using neural ODE
-                    xt_batch = self._integrate_to_time(z0_batch, control_time)
+                    # Step 1: Flow matching interpolation: xt = (1-t) * z0 + t * z1
+                    t = control_time
+                    xt_batch = (1 - t) * z0_batch + t * z1_batch
                     
-                all_xt.append(xt_batch.cpu())
+                    # Step 2: Extract TRUE U-Space from UNet bottleneck
+                    uspace_batch = self._extract_bottleneck_features(xt_batch, 
+                                                                   torch.ones(len(xt_batch), device=self.device) * t)
+                    
+                all_uspace.append(uspace_batch.cpu())
                 
                 # Force garbage collection after each batch
-                del xt_batch, z0_batch
+                del uspace_batch, xt_batch, z0_batch, z1_batch
                 torch.cuda.empty_cache()
                 gc.collect()
                 
@@ -203,9 +217,9 @@ class USpaceExtractor:
             
             # Save intermediate results every save_interval batches
             if (batch_idx + 1) % save_interval == 0 or batch_idx == num_batches - 1:
-                if all_xt:  # Only save if we have data
+                if all_uspace:  # Only save if we have data
                     # Concatenate current batch
-                    temp_tensor = torch.cat(all_xt, dim=0)
+                    temp_tensor = torch.cat(all_uspace, dim=0)
                     temp_data = temp_tensor.cpu().numpy()
                     
                     # Save to temporary file
@@ -215,8 +229,8 @@ class USpaceExtractor:
                     logging.info(f"Saved temporary chunk {temp_file_counter} ({len(temp_data)} samples) to {temp_file}")
                     
                     # Clear memory
-                    del temp_tensor, temp_data, all_xt
-                    all_xt = []
+                    del temp_tensor, temp_data, all_uspace
+                    all_uspace = []
                     temp_file_counter += 1
                     
                     # Force cleanup
@@ -250,7 +264,7 @@ class USpaceExtractor:
         final_shape = (total_samples,) + sample_shape
         logging.info(f"Creating final output file with shape: {final_shape}")
         
-        final_result_file = os.path.join(temp_save_dir, "final_uspace_result.npy")
+        final_result_file = os.path.join(temp_save_dir, "final_true_uspace_result.npy")
         final_array = np.memmap(final_result_file, dtype=np.float32, mode='w+', shape=final_shape)
         
         # Second pass: copy data chunk by chunk
@@ -277,7 +291,7 @@ class USpaceExtractor:
         # Flush the memmap to ensure data is written
         del final_array
         
-        logging.info(f"Final result saved to: {final_result_file}")
+        logging.info(f"Final TRUE U-Space result saved to: {final_result_file}")
         
         # Return based on what the caller needs
         if return_path:
@@ -285,7 +299,7 @@ class USpaceExtractor:
             return final_result_file
         else:
             # Load the result for backwards compatibility
-            xt_data = np.load(final_result_file)
+            uspace_data = np.load(final_result_file)
             # Clean up the file since we loaded it
             os.remove(final_result_file)
             
@@ -295,149 +309,176 @@ class USpaceExtractor:
             except OSError:
                 logging.warning(f"Could not remove temporary directory {temp_save_dir}")
             
-            logging.info(f"Extracted xt data shape: {xt_data.shape}")
-            return xt_data
+            logging.info(f"Extracted TRUE U-Space data shape: {uspace_data.shape}")
+            return uspace_data
         
-    def _integrate_to_time(self, z0_batch: torch.Tensor, target_time: float) -> torch.Tensor:
+    def _extract_bottleneck_features(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         """
-        Integrate from z0 to xt using Euler method with score model
+        Extract TRUE bottleneck features from UNet using forward hooks
         
         Args:
-            z0_batch: initial noise (batch_size, channels, height, width)
-            target_time: target time t
+            x: Input tensor (batch_size, channels, height, width)
+            t: Time tensor (batch_size,)
             
         Returns:
-            xt_batch: u-space at time t
+            bottleneck_features: UNet bottleneck features as TRUE U-Space
         """
-        # ODE integration steps
-        num_steps = 10  # Increased for better accuracy at t=0.2
-        dt = target_time / num_steps
+        # Register forward hook to capture bottleneck features
+        bottleneck_features = []
         
-        # Start from z0
-        xt = z0_batch.clone()
+        def hook_fn(module, input, output):
+            # Capture the bottleneck features
+            bottleneck_features.append(output.clone())
         
-        # Integrate using Euler method with aggressive memory optimization
-        for step in range(num_steps):
-            current_time = step * dt
-            t_tensor = torch.ones(xt.shape[0], device=self.device) * current_time
-            
-            # Get velocity from score model with enhanced memory management
+        # Find the bottleneck layer (middle of the UNet)
+        # For NCSN++ architecture, look for the middle block
+        hook_handle = None
+        target_module = None
+        
+        # Try to find the middle/bottleneck layer
+        if hasattr(self.score_model, 'all_modules'):
+            # For NCSN++ models with all_modules
+            modules = list(self.score_model.all_modules)
+            middle_idx = len(modules) // 2
+            target_module = modules[middle_idx]
+        elif hasattr(self.score_model, 'module_list') or hasattr(self.score_model, 'modules'):
+            # Alternative module access
+            modules = list(self.score_model.modules())
+            # Find conv layers and take one from the middle
+            conv_modules = [m for m in modules if isinstance(m, (torch.nn.Conv2d, torch.nn.ConvTranspose2d))]
+            if conv_modules:
+                middle_idx = len(conv_modules) // 2
+                target_module = conv_modules[middle_idx]
+        
+        if target_module is None:
+            # Fallback: use the entire model output and spatially pool
+            logging.warning("Could not find bottleneck layer, using model output with pooling")
             with torch.no_grad():
-                try:
-                    # Use torch.inference_mode for additional memory savings
-                    with torch.inference_mode():
-                        velocity = self.score_model(xt, t_tensor)
-                except RuntimeError as e:
-                    if "out of memory" in str(e):
-                        logging.error(f"GPU out of memory during integration at step {step}")
-                        torch.cuda.empty_cache()
-                        gc.collect()
-                        raise
+                model_output = self.score_model(x, t)
+                # Global average pooling to create bottleneck-like features
+                bottleneck = torch.mean(model_output, dim=[2, 3], keepdim=True)  # (B, C, 1, 1)
+                return bottleneck
+        
+        # Register hook
+        hook_handle = target_module.register_forward_hook(hook_fn)
+        
+        try:
+            with torch.no_grad():
+                # Forward pass to trigger the hook
+                _ = self.score_model(x, t)
+                
+                if bottleneck_features:
+                    # Use the captured features
+                    features = bottleneck_features[0]
+                    
+                    # If features are spatial (H, W > 1), pool them to create compact representation
+                    if len(features.shape) == 4 and features.shape[-1] > 1:
+                        # Global average pooling
+                        pooled_features = torch.mean(features, dim=[2, 3], keepdim=True)
+                        return pooled_features
                     else:
-                        raise
-                
-            # Euler step: xt = xt + dt * velocity
-            xt = xt + dt * velocity
-            
-            # Immediate cleanup of intermediate variables
-            del velocity, t_tensor
-            
-            # More frequent cleanup for final stages
-            torch.cuda.empty_cache()
-            if step % 2 == 0:  # Every 2 steps instead of 5
-                gc.collect()
-                
-        return xt
+                        return features
+                else:
+                    logging.warning("No bottleneck features captured, using fallback")
+                    # Fallback: use spatial pooling of input
+                    return torch.mean(x, dim=[2, 3], keepdim=True)
+                    
+        finally:
+            # Clean up hook
+            if hook_handle is not None:
+                hook_handle.remove()
         
     def extract_multi_time_uspace(self, z0_data: np.ndarray, z1_data: np.ndarray,
                                   time_points: List[float], 
-                                  method: str = 'neural_ode',
+                                  method: str = 'true_uspace',
                                   output_dir: str = None) -> Dict[float, str]:
         """
-        Extract u-space representations at multiple time points with incremental saving
+        Extract TRUE U-Space representations at multiple time points with incremental saving
         
         Args:
             z0_data: noise vectors
             z1_data: target images
             time_points: list of time points to extract (e.g., [0.1, 0.25, 0.5, 0.75])
-            method: only 'neural_ode' supported
+            method: only 'true_uspace' supported (extracts UNet bottleneck features)
             output_dir: directory to save results (if None, return data in memory)
             
         Returns:
-            Dictionary mapping time points to file paths (if output_dir provided) or xt data
+            Dictionary mapping time points to file paths (if output_dir provided) or uspace data
         """
-        logging.info(f"Extracting u-space at multiple time points: {time_points}")
+        logging.info(f"Extracting TRUE U-Space at multiple time points: {time_points}")
         
-        if method != 'neural_ode':
-            raise ValueError("Only 'neural_ode' method is supported now")
+        if method != 'true_uspace':
+            raise ValueError("Only 'true_uspace' method is supported now")
         
         uspace_results = {}
         
         for t in time_points:
             logging.info(f"Processing time point t={t}")
             
-            # Neural ODE integration with temp saving
+            # TRUE U-Space extraction with temp saving
             temp_dir = os.path.join(output_dir, f"temp_t_{t:.2f}") if output_dir else None
             
             if output_dir:
                 # Get the file path directly without loading to memory
-                result_file = self.extract_xt_with_neural_ode(z0_data, t, temp_save_dir=temp_dir, return_path=True)
+                result_file = self.extract_true_uspace_from_unet(z0_data, z1_data, t, temp_save_dir=temp_dir, return_path=True)
                 
                 # Move the result file to the final location
-                output_file = os.path.join(output_dir, f'uspace_t_{t:.2f}.npy')
+                output_file = os.path.join(output_dir, f'true_uspace_t_{t:.2f}.npy')
                 import shutil
                 shutil.move(result_file, output_file)
                 
-                # No need to load xt_data into memory since we're saving files
-                xt_data = None  # Placeholder
+                # No need to load uspace_data into memory since we're saving files
+                uspace_data = None  # Placeholder
             else:
                 # Load into memory if not saving to files
-                xt_data = self.extract_xt_with_neural_ode(z0_data, t, temp_save_dir=temp_dir)
+                uspace_data = self.extract_true_uspace_from_unet(z0_data, z1_data, t, temp_save_dir=temp_dir)
             
             # Save immediately if output directory is provided
             if output_dir:
                 os.makedirs(output_dir, exist_ok=True)
                 
-                # For neural_ode, the file is already created above
+                # For true_uspace, the file is already created above
                 # Also save metadata
-                metadata_file = os.path.join(output_dir, f'uspace_t_{t:.2f}_metadata.pkl')
+                metadata_file = os.path.join(output_dir, f'true_uspace_t_{t:.2f}_metadata.pkl')
                 with open(metadata_file, 'wb') as f:
                     pickle.dump({
                         'time': t,
                         'method': method,
-                        'shape': xt_data.shape if xt_data is not None else "saved_to_file",
+                        'shape': uspace_data.shape if uspace_data is not None else "saved_to_file",
                         'extraction_time': t,
                         'method_used': method,
-                        'data_file': output_file
+                        'data_file': output_file,
+                        'is_true_uspace': True,
+                        'bottleneck_features': True
                     }, f)
                 
-                logging.info(f"Saved u-space data for t={t} to: {output_file}")
+                logging.info(f"Saved TRUE U-Space data for t={t} to: {output_file}")
                 uspace_results[t] = output_file
                 
                 # Clear data from memory immediately
-                if xt_data is not None:
-                    del xt_data
+                if uspace_data is not None:
+                    del uspace_data
                 gc.collect()
             else:
-                uspace_results[t] = xt_data
+                uspace_results[t] = uspace_data
             
-        logging.info(f"Extracted u-space data for {len(time_points)} time points")
+        logging.info(f"Extracted TRUE U-Space data for {len(time_points)} time points")
         return uspace_results
         
     def process_existing_data_pairs(self, data_path: str, output_dir: str,
                                    time_points: List[float] = None,
-                                   method: str = 'neural_ode',
+                                   method: str = 'true_uspace',
                                    checkpoint_path: str = None,
                                    iteration: int = None):
         """
-        Process existing (z0, z1) pairs to extract u-space representations
+        Process existing (z0, z1) pairs to extract TRUE U-Space representations
         
         Args:
             data_path: path to existing data pairs file (.pt or .pkl)
             output_dir: directory to save extracted u-space data
             time_points: list of time points to extract
-            method: extraction method (only 'neural_ode' supported)
-            checkpoint_path: path to model checkpoint (required for neural_ode)
+            method: extraction method (only 'true_uspace' supported)
+            checkpoint_path: path to model checkpoint (required for true_uspace)
             iteration: iteration number for organizing outputs
         """
         logging.info(f"Processing existing data pairs from: {data_path}")
@@ -468,13 +509,13 @@ class USpaceExtractor:
         logging.info(f"Loaded z0 shape: {z0_data.shape if hasattr(z0_data, 'shape') else len(z0_data)}")
         logging.info(f"Loaded z1 shape: {z1_data.shape if hasattr(z1_data, 'shape') else len(z1_data)}")
         
-        # Load model if using neural ODE method
-        if method == 'neural_ode':
+        # Load model if using true_uspace method
+        if method == 'true_uspace':
             if checkpoint_path is None:
-                raise ValueError("checkpoint_path required for neural_ode method")
+                raise ValueError("checkpoint_path required for true_uspace method")
             self.load_model(checkpoint_path)
             
-        # Extract u-space representations with incremental saving
+        # Extract TRUE U-Space representations with incremental saving
         uspace_results = self.extract_multi_time_uspace(
             z0_data, z1_data, time_points, method, output_dir
         )
@@ -490,143 +531,41 @@ class USpaceExtractor:
                 'num_samples': len(z0_data),
                 'time_points': time_points,
                 'extraction_method': method,
-                'incremental_save': True
+                'incremental_save': True,
+                'is_true_uspace': True,
+                'bottleneck_features': True
             }
         }
         
         # Save summary file
-        summary_file = os.path.join(output_dir, 'uspace_extraction_summary.pkl')
+        summary_file = os.path.join(output_dir, 'true_uspace_extraction_summary.pkl')
         with open(summary_file, 'wb') as f:
             pickle.dump(summary_data, f)
             
-        logging.info(f"Saved extraction summary to: {summary_file}")
-        logging.info("U-space extraction completed with incremental saving!")
+        logging.info(f"Saved TRUE U-Space extraction summary to: {summary_file}")
+        logging.info("TRUE U-Space extraction completed with incremental saving!")
         
         return summary_file
 
-    def extract_true_uspace_from_unet(self, z0_data: np.ndarray, z1_data: np.ndarray, 
-                                     control_time: float, batch_size: int = 4) -> np.ndarray:
-        """
-        Extract TRUE U-Space representations from UNet bottleneck features
-        
-        Process:
-        1. Interpolate: xt = (1-t) * z0 + t * z1
-        2. Forward through UNet encoder to bottleneck
-        3. Extract bottleneck features as true U-Space
-        
-        Args:
-            z0_data: noise vectors (batch, channels, height, width)
-            z1_data: target images (batch, channels, height, width)
-            control_time: time t for extraction (0.0 to 1.0)
-            batch_size: batch size for processing
-            
-        Returns:
-            uspace_data: TRUE U-Space features from UNet bottleneck
-        """
-        if self.score_model is None:
-            raise ValueError("Model not loaded! Call load_model() first.")
-            
-        logging.info(f"Extracting TRUE U-Space from UNet bottleneck at t={control_time}...")
-        
-        # Convert to tensors
-        if isinstance(z0_data, np.ndarray):
-            z0_tensor = torch.from_numpy(z0_data)
-        else:
-            z0_tensor = z0_data
-            
-        if isinstance(z1_data, np.ndarray):
-            z1_tensor = torch.from_numpy(z1_data)
-        else:
-            z1_tensor = z1_data
-        
-        # Ensure same device
-        z0_tensor = z0_tensor.to(self.device)
-        z1_tensor = z1_tensor.to(self.device)
-        
-        num_samples = len(z0_tensor)
-        uspace_features = []
-        
-        self.score_model.eval()
-        with torch.no_grad():
-            for i in tqdm(range(0, num_samples, batch_size), desc="Extracting U-Space"):
-                batch_z0 = z0_tensor[i:i+batch_size]
-                batch_z1 = z1_tensor[i:i+batch_size]
-                
-                # Step 1: Flow matching interpolation
-                t = control_time
-                xt_batch = (1 - t) * batch_z0 + t * batch_z1
-                
-                # Step 2: Create time tensor
-                time_tensor = torch.ones(len(xt_batch), device=self.device) * t
-                
-                # Step 3: Extract bottleneck features from UNet
-                # This depends on the specific UNet architecture
-                try:
-                    # For NCSN++ models, we need to hook into the bottleneck
-                    bottleneck_features = self._extract_bottleneck_features(xt_batch, time_tensor)
-                    uspace_features.append(bottleneck_features.cpu())
-                except Exception as e:
-                    logging.error(f"Failed to extract bottleneck features: {e}")
-                    # Fallback: use intermediate layer features
-                    # This is a placeholder - needs specific implementation
-                    logging.warning("Using placeholder features - implement bottleneck extraction!")
-                    placeholder_features = torch.mean(xt_batch, dim=[2, 3], keepdim=True)  # Simple pooling
-                    uspace_features.append(placeholder_features.cpu())
-                
-                # Memory cleanup
-                if i % (batch_size * 10) == 0:
-                    torch.cuda.empty_cache()
-        
-        # Combine all features
-        uspace_tensor = torch.cat(uspace_features, dim=0)
-        uspace_data = uspace_tensor.numpy()
-        
-        logging.info(f"Extracted TRUE U-Space shape: {uspace_data.shape}")
-        return uspace_data
-    
-    def _extract_bottleneck_features(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        """
-        Extract bottleneck features from UNet
-        
-        This is a placeholder - needs to be implemented based on specific UNet architecture
-        """
-        # TODO: Implement based on actual UNet architecture
-        # For NCSN++, we need to hook into the middle layers
-        
-        # This is a simplified placeholder
-        logging.warning("Bottleneck feature extraction not implemented - using placeholder!")
-        
-        # Placeholder: use model forward pass and extract intermediate features
-        # In practice, you'd need to modify the model or use hooks
-        with torch.no_grad():
-            # This just runs the full model - we need to extract intermediate features
-            model_output = self.score_model(x, t)
-            
-            # Placeholder: use spatial average as "bottleneck features"
-            # In reality, you'd extract features from the actual bottleneck layer
-            bottleneck_placeholder = torch.mean(model_output, dim=[2, 3], keepdim=True)
-            
-        return bottleneck_placeholder
-
 
 def main():
-    """Main function to extract u-space from existing data pairs"""
+    """Main function to extract TRUE U-Space from existing data pairs"""
     import argparse
     from configs.celeba_256_semantic_reflow_iterative import get_config
     
-    parser = argparse.ArgumentParser(description='Extract U-Space from Flow Matching')
+    parser = argparse.ArgumentParser(description='Extract TRUE U-Space from Flow Matching')
     parser.add_argument('--data_path', type=str, required=True,
                        help='Path to existing (z0, z1) data pairs file')
-    parser.add_argument('--output_dir', type=str, default='workdir/uspace_extracted',
-                       help='Output directory for u-space data')
+    parser.add_argument('--output_dir', type=str, default='workdir/true_uspace_extracted',
+                       help='Output directory for TRUE U-Space data')
     parser.add_argument('--time_points', nargs='+', type=float, 
                        default=[0.1, 0.25, 0.5, 0.75],
                        help='Time points to extract (e.g., 0.1 0.25 0.5)')
-    parser.add_argument('--method', type=str, choices=['neural_ode'],
-                       default='neural_ode',
-                       help='Extraction method (only neural_ode supported)')
+    parser.add_argument('--method', type=str, choices=['true_uspace'],
+                       default='true_uspace',
+                       help='Extraction method (only true_uspace supported - extracts UNet bottleneck features)')
     parser.add_argument('--checkpoint_path', type=str,
-                       help='Path to model checkpoint (required for neural_ode method)')
+                       help='Path to model checkpoint (required for true_uspace method)')
     parser.add_argument('--control_time', type=float, default=0.25,
                        help='Main control time point')
     parser.add_argument('--iteration', type=int,
@@ -644,13 +583,13 @@ def main():
     config = get_config()
     
     # Validate arguments
-    if args.method == 'neural_ode' and args.checkpoint_path is None:
-        raise ValueError("--checkpoint_path is required when using neural_ode method")
+    if args.method == 'true_uspace' and args.checkpoint_path is None:
+        raise ValueError("--checkpoint_path is required when using true_uspace method")
         
     if not os.path.exists(args.data_path):
         raise FileNotFoundError(f"Data file not found: {args.data_path}")
         
-    # Create u-space extractor
+    # Create TRUE U-Space extractor
     extractor = USpaceExtractor(config, control_time=args.control_time)
     
     # Process existing data
@@ -663,7 +602,7 @@ def main():
         iteration=args.iteration
     )
     
-    logging.info(f"U-space extraction completed!")
+    logging.info(f"TRUE U-Space extraction completed!")
     logging.info(f"Combined data saved to: {combined_file}")
     logging.info(f"Individual time point files saved in: {args.output_dir}")
 

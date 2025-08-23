@@ -479,13 +479,38 @@ def generate_data_from_z0(config, workdir, num_samples):
         
         # Save each batch immediately to avoid memory accumulation
         batch_file_path = os.path.join(pt_files_dir, f'batch_{batch_idx+1}_pairs.pt')
-        torch.save({
-            'z0_batch': z0.cpu(),
-            'z1_batch': z1.cpu(),
-            'batch_idx': batch_idx,
-            'total_batches': num_batches,
-            'batch_size': z0.shape[0]
-        }, batch_file_path)
+        
+        # Robust save with error handling and memory optimization
+        try:
+            # Move to CPU and ensure contiguous memory layout
+            z0_cpu = z0.cpu().contiguous()
+            z1_cpu = z1.cpu().contiguous()
+            
+            torch.save({
+                'z0_batch': z0_cpu,
+                'z1_batch': z1_cpu,
+                'batch_idx': batch_idx,
+                'total_batches': num_batches,
+                'batch_size': z0.shape[0]
+            }, batch_file_path, pickle_protocol=4, _use_new_zipfile_serialization=False)
+            
+            # Clean up CPU tensors
+            del z0_cpu, z1_cpu
+            
+        except Exception as save_error:
+            logging.warning(f"Failed to save batch {batch_idx+1} with torch.save: {save_error}")
+            logging.info(f"Falling back to numpy save for batch {batch_idx+1}")
+            
+            # Fallback: save as numpy arrays
+            import numpy as np
+            batch_file_path_npz = batch_file_path.replace('.pt', '.npz')
+            np.savez_compressed(batch_file_path_npz,
+                               z0_batch=z0.cpu().numpy(),
+                               z1_batch=z1.cpu().numpy(),
+                               batch_idx=batch_idx,
+                               total_batches=num_batches,
+                               batch_size=z0.shape[0])
+            batch_file_path = batch_file_path_npz
         
         # Save images as individual files
         batch_start_idx = batch_idx * generation_batch_size
@@ -526,9 +551,16 @@ def generate_data_from_z0(config, workdir, num_samples):
         chunk_z1 = []
         
         for i in range(chunk_start, chunk_end):
-            batch_data = torch.load(batch_files[i], map_location='cpu')
-            chunk_z0.append(batch_data['z0_batch'])
-            chunk_z1.append(batch_data['z1_batch'])
+            # Handle both .pt and .npz files
+            if batch_files[i].endswith('.npz'):
+                import numpy as np
+                batch_data = np.load(batch_files[i])
+                chunk_z0.append(torch.from_numpy(batch_data['z0_batch']))
+                chunk_z1.append(torch.from_numpy(batch_data['z1_batch']))
+            else:
+                batch_data = torch.load(batch_files[i], map_location='cpu')
+                chunk_z0.append(batch_data['z0_batch'])
+                chunk_z1.append(batch_data['z1_batch'])
         
         all_z0.append(torch.cat(chunk_z0, dim=0))
         all_z1.append(torch.cat(chunk_z1, dim=0))
@@ -545,9 +577,35 @@ def generate_data_from_z0(config, workdir, num_samples):
     del all_z0, all_z1
     gc.collect()
     
-    # Save final consolidated data
+    # Save final consolidated data with robust error handling
     data_path = os.path.join(generate_dir, 'generated_pairs.pt')
-    torch.save({'z0': z0_data, 'z1': z1_data}, data_path)
+    try:
+        # Ensure tensors are contiguous and on CPU
+        z0_save = z0_data.cpu().contiguous()
+        z1_save = z1_data.cpu().contiguous()
+        
+        torch.save({'z0': z0_save, 'z1': z1_save}, data_path, pickle_protocol=4, _use_new_zipfile_serialization=False)
+        logging.info(f"Saved final data to {data_path}")
+        
+    except Exception as save_error:
+        logging.warning(f"Failed to save final data with torch.save: {save_error}")
+        logging.info("Falling back to numpy save for final data")
+        
+        # Fallback: save as numpy arrays
+        import numpy as np
+        data_path_npz = data_path.replace('.pt', '.npz')
+        np.savez_compressed(data_path_npz,
+                           z0=z0_data.cpu().numpy(),
+                           z1=z1_data.cpu().numpy())
+        data_path = data_path_npz
+        logging.info(f"Saved final data to {data_path}")
+    
+    finally:
+        # Clean up data copies
+        if 'z0_save' in locals():
+            del z0_save
+        if 'z1_save' in locals():
+            del z1_save
     
     # Save final image grid
     final_grid_path = os.path.join(generate_dir, 'all_generated_grid.png')
@@ -669,8 +727,34 @@ def generate_semantic_data_pairs(config,
         batch_noise_path = os.path.join(pt_semantic_dir, f'noise_batch_{batch_num}.pt')
         batch_images_path = os.path.join(pt_semantic_dir, f'images_batch_{batch_num}.pt')
         
-        torch.save(noise_batch, batch_noise_path)
-        torch.save(image_batch.cpu(), batch_images_path)
+        # Robust save with error handling and memory optimization
+        try:
+            # Move to CPU and ensure contiguous memory layout
+            noise_batch_cpu = noise_batch.cpu().contiguous()
+            image_batch_cpu = image_batch.cpu().contiguous()
+            
+            # Save with pickle protocol 4 and compression disabled
+            torch.save(noise_batch_cpu, batch_noise_path, pickle_protocol=4, _use_new_zipfile_serialization=False)
+            torch.save(image_batch_cpu, batch_images_path, pickle_protocol=4, _use_new_zipfile_serialization=False)
+            
+            # Clean up CPU tensors immediately
+            del noise_batch_cpu, image_batch_cpu
+            
+        except Exception as save_error:
+            logging.warning(f"Failed to save batch {batch_num} with torch.save: {save_error}")
+            logging.info(f"Falling back to individual tensor saves for batch {batch_num}")
+            
+            # Fallback: save individual samples in the batch
+            batch_noise_dir = os.path.join(pt_semantic_dir, f'noise_batch_{batch_num}')
+            batch_images_dir = os.path.join(pt_semantic_dir, f'images_batch_{batch_num}')
+            os.makedirs(batch_noise_dir, exist_ok=True)
+            os.makedirs(batch_images_dir, exist_ok=True)
+            
+            for idx in range(len(noise_batch)):
+                individual_noise_path = os.path.join(batch_noise_dir, f'sample_{idx}.pt')
+                individual_image_path = os.path.join(batch_images_dir, f'sample_{idx}.pt')
+                torch.save(noise_batch[idx:idx+1].cpu().contiguous(), individual_noise_path, pickle_protocol=4)
+                torch.save(image_batch[idx:idx+1].cpu().contiguous(), individual_image_path, pickle_protocol=4)
         
         # Count classified images but don't save individual files to save space
         for j, label in enumerate(labels):
@@ -712,6 +796,14 @@ def generate_semantic_data_pairs(config,
         all_noise_files.append(batch_noise_path)
         all_images_files.append(batch_images_path)
         all_labels.extend(labels)
+        
+        # Clear GPU memory immediately after processing each batch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+        # Force garbage collection every few batches
+        if (i // batch_size + 1) % 10 == 0:
+            gc.collect()
         
         # Save intermediate classification results every 50 batches to reduce log noise
         if batch_num % 50 == 0 or end_idx >= len(z0_tensor):
