@@ -23,6 +23,11 @@ import sys
 import json
 import logging
 import pickle
+import argparse
+import numpy as np
+import torch
+import wandb
+import gc
 from datetime import datetime
 import importlib.util
 
@@ -31,6 +36,83 @@ sys.path.append('/home/felix/RectifiedFlow/ImageGeneration')
 
 from extract_uspace_from_flow import USpaceExtractor
 from semantic_boundary_trainer import SemanticBoundaryTrainer
+
+
+def get_adaptive_control_strength(probability, target_direction, base_strength=1.0):
+    """
+    Calculate adaptive control strength based on classification probability
+    
+    Args:
+        probability (float): Current sample classification probability [0,1]
+        target_direction (int): Target direction, 1 for enhance, -1 for reverse
+        base_strength (float): Base control strength, default 1.0
+    
+    Returns:
+        float: Calculated adaptive control strength k
+    """
+    # Scale probability to [-1, 1] range for bidirectional control
+    k = base_strength * (2 * probability - 1) * target_direction
+    
+    # Limit k value range
+    k = max(-2.0, min(2.0, k))
+    return k
+
+
+def determine_target_direction(current_label, desired_label):
+    """
+    Determine control direction
+    
+    Args:
+        current_label (int): Current label (0 or 1)
+        desired_label (int): Target label (0 or 1)
+    
+    Returns:
+        int: target_direction (1 or -1)
+    """
+    if desired_label > current_label:
+        return 1  # Enhance attribute
+    else:
+        return -1  # Reduce/reverse attribute
+
+
+def print_k_statistics(k_values, probabilities, epoch):
+    """Print k value statistics and log to wandb"""
+    if len(k_values) > 0:
+        import numpy as np
+        mean_k = np.mean(k_values)
+        std_k = np.std(k_values)
+        min_k = np.min(k_values)
+        max_k = np.max(k_values)
+        
+        logging.info(f"Epoch {epoch} - Adaptive strengths: Mean={mean_k:.3f}, Std={std_k:.3f}, Min={min_k:.3f}, Max={max_k:.3f}")
+        
+        # Log statistics for different confidence intervals
+        low_prob_k = [k for k, p in zip(k_values, probabilities) if p < 0.3]
+        mid_prob_k = [k for k, p in zip(k_values, probabilities) if 0.3 <= p <= 0.7]
+        high_prob_k = [k for k, p in zip(k_values, probabilities) if p > 0.7]
+        
+        if low_prob_k: 
+            logging.info(f"  Low confidence (p<0.3): Mean k={np.mean(low_prob_k):.3f}")
+        if mid_prob_k: 
+            logging.info(f"  Mid confidence (0.3≤p≤0.7): Mean k={np.mean(mid_prob_k):.3f}")
+        if high_prob_k: 
+            logging.info(f"  High confidence (p>0.7): Mean k={np.mean(high_prob_k):.3f}")
+        
+        # Log to wandb if available
+        try:
+            import wandb
+            wandb.log({
+                f'adaptive_k/mean': mean_k,
+                f'adaptive_k/std': std_k,
+                f'adaptive_k/min': min_k,
+                f'adaptive_k/max': max_k,
+                f'adaptive_k/low_conf_mean': np.mean(low_prob_k) if low_prob_k else 0,
+                f'adaptive_k/mid_conf_mean': np.mean(mid_prob_k) if mid_prob_k else 0,
+                f'adaptive_k/high_conf_mean': np.mean(high_prob_k) if high_prob_k else 0,
+                'epoch': epoch
+            })
+        except:
+            pass
 
 
 def setup_logging(workdir):
@@ -113,36 +195,97 @@ def run_single_iteration(config, workdir, iteration, base_model_path):
     iteration_dir = os.path.join(workdir, f'iteration_{iteration}')
     os.makedirs(iteration_dir, exist_ok=True)
     
-    # Step 1: Generate semantic data pairs using current model
-    logging.info("Step 1: Generating semantic data pairs...")
-    from run_lib_semantic_reflow import generate_semantic_data_pairs
-    
-    # Get parameters from config
-    interfacegan_path = config.semantic.interfacegan_model_path
-    num_samples = config.semantic.num_semantic_samples
-    
-    semantic_data_path = generate_semantic_data_pairs(
-        config=config,
-        workdir=iteration_dir,
-        interfacegan_model_path=interfacegan_path,
-        num_samples=num_samples
-    )
-    
-    # Validate semantic data path
-    logging.info(f"Generated semantic data path: {semantic_data_path}")
-    if not os.path.exists(semantic_data_path):
-        raise FileNotFoundError(f"Semantic data file not found: {semantic_data_path}")
-    if not (semantic_data_path.endswith('.pt') or semantic_data_path.endswith('.pkl')):
-        raise ValueError(f"Semantic data file must be .pt or .pkl format, got: {semantic_data_path}")
-    
-    # Step 2: Extract U-Space representations at t=0.2 (using TRUE U-Space from UNet bottleneck)
-    logging.info("Step 2: Extracting TRUE U-Space representations from UNet bottleneck...")
+    # Step 1: Check for existing semantic data in current iteration, then generate if needed
+    logging.info("Step 1: Looking for semantic data...")
+
+    # Check if semantic data already exists in current iteration
+    current_semantic_dir = os.path.join(iteration_dir, 'semantic_analysis')
+    semantic_data_found = False
+
+    if os.path.exists(current_semantic_dir):
+        # Check both root directory and pt_files subdirectory
+        data_files = []
+        
+        # Check root semantic_analysis directory
+        root_files = [f for f in os.listdir(current_semantic_dir) 
+                     if f.endswith('.pt') or f.endswith('.pkl')]
+        if root_files:
+            data_files.extend(root_files)
+            
+        # Check pt_files subdirectory  
+        pt_files_dir = os.path.join(current_semantic_dir, 'pt_files')
+        if os.path.exists(pt_files_dir):
+            pt_files = [f for f in os.listdir(pt_files_dir) 
+                       if f.endswith('.pt') or f.endswith('.pkl')]
+            if pt_files:
+                # Use pt_files directory as the semantic data path
+                semantic_data_path = pt_files_dir
+                semantic_data_found = True
+                logging.info(f"Found existing semantic data in pt_files: {semantic_data_path}")
+                logging.info(f"Found {len(pt_files)} data files in pt_files: {pt_files[:5]}...")  # Show first 5 files
+                
+        # If we found files in root but not in pt_files, use root
+        if not semantic_data_found and root_files:
+            semantic_data_path = current_semantic_dir
+            semantic_data_found = True
+            logging.info(f"Found existing semantic data in root: {semantic_data_path}")
+            logging.info(f"Found {len(root_files)} data files: {root_files}")
+            
+        # Also check for generated_data directory with generated_pairs.pt
+        if not semantic_data_found:
+            generated_data_dir = os.path.join(iteration_dir, 'generated_data')
+            if os.path.exists(generated_data_dir):
+                generated_files = [f for f in os.listdir(generated_data_dir) 
+                                 if f.endswith('.pt') or f.endswith('.pkl')]
+                if generated_files:
+                    semantic_data_path = generated_data_dir
+                    semantic_data_found = True
+                    logging.info(f"Found existing semantic data in generated_data: {semantic_data_path}")
+                    logging.info(f"Found {len(generated_files)} data files: {generated_files}")
+
+    if not semantic_data_found:
+        # Generate new semantic data pairs
+        logging.info("Generating new semantic data pairs...")
+        try:
+            from run_lib_semantic_reflow import generate_semantic_data_pairs
+            
+            # Get parameters from config
+            interfacegan_path = config.semantic.interfacegan_model_path
+            num_samples = config.semantic.num_semantic_samples
+            
+            semantic_data_path = generate_semantic_data_pairs(
+                config=config,
+                workdir=iteration_dir,
+                interfacegan_model_path=interfacegan_path,
+                num_samples=num_samples
+            )
+            logging.info(f"Generated new semantic data path: {semantic_data_path}")
+            
+            # Verify the generated data
+            if os.path.exists(semantic_data_path):
+                generated_files = [f for f in os.listdir(semantic_data_path) 
+                                if f.endswith('.pt') or f.endswith('.pkl')]
+                logging.info(f"Generated {len(generated_files)} data files: {generated_files}")
+            else:
+                raise FileNotFoundError(f"Generated semantic data path does not exist: {semantic_data_path}")
+                
+        except ImportError as e:
+            logging.error(f"Failed to import generate_semantic_data_pairs: {e}")
+            raise
+        except Exception as e:
+            logging.error(f"Failed to generate semantic data: {e}")
+            raise
+
+
+    # Step 2: Extract U-Space representations at t=0.2 (using U-Space from UNet bottleneck)
+
+    logging.info("Step 2: Extracting U-Space representations from UNet bottleneck...")
     control_time = getattr(config, 'semantic', {}).get('control_time', 0.2)
     uspace_extractor = USpaceExtractor(config, control_time=control_time)
     
-    # Process data pairs to extract TRUE U-Space using UNet bottleneck features
+    # Process data pairs to extract U-Space using UNet bottleneck features (memory-efficient)
     workdir_parent = os.path.dirname(iteration_dir)
-    combined_file = uspace_extractor.process_existing_data_pairs(
+    combined_file = uspace_extractor.process_existing_data_pairs_efficient(
         data_path=semantic_data_path,
         output_dir=workdir_parent,
         time_points=[control_time],
@@ -154,8 +297,8 @@ def run_single_iteration(config, workdir, iteration, base_model_path):
     uspace_dir = os.path.join(iteration_dir, 'uspace_extracted')
     logging.info(f"U-Space extraction completed, results in: {uspace_dir}")
     
-    # Step 3: Train semantic boundary in TRUE U-Space using SVM
-    logging.info("Step 3: Training semantic boundary in TRUE U-Space...")
+    # Step 3: Train semantic boundary in U-Space using SVM
+    logging.info("Step 3: Training semantic boundary in U-Space...")
     boundary_trainer = SemanticBoundaryTrainer(
         interfacegan_model_path=getattr(config.semantic, 'interfacegan_model_path', ''),
         device=str(config.device)

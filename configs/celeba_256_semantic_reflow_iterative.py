@@ -6,8 +6,8 @@ def get_config():
     
     # Training
     config.training = training = ml_collections.ConfigDict()
-    training.batch_size = 4  # Reduced for memory efficiency
-    training.eval_batch_size = 8  # Reduced from 16
+    training.batch_size = 2  # Reduced for memory efficiency
+    training.eval_batch_size = 4  # Reduced from 16
     training.n_epochs = 100
     training.n_iters = 50000  # Reduced for faster iterations
     training.snapshot_freq = 2500  # More frequent snapshots
@@ -88,8 +88,8 @@ def get_config():
     config.training = training = ml_collections.ConfigDict()
     training.continuous = True
     training.reduce_mean = True
-    training.batch_size = 4  # Memory-safe batch size
-    training.n_iters = 50000  # Reduced for faster iterations
+    training.batch_size = 2  # Memory-safe batch size
+    training.n_iters = 10000  # Reduced for faster iterations
     training.snapshot_freq = 2500  # Save more frequently
     training.log_freq = 50
     training.eval_freq = 500

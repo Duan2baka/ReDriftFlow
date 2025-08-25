@@ -137,14 +137,15 @@ class SemanticBoundaryTrainer:
         return model
         return model
     
-    def classify_images(self, images: torch.Tensor, debug: bool = False) -> np.ndarray:
+    def classify_images(self, images: torch.Tensor, debug: bool = False, return_probabilities: bool = False) -> np.ndarray:
         """
         Classify images using the InterfaceGAN predictor
         Args:
             images: Tensor of shape (batch_size, 3, H, W)
             debug: Whether to print debug information
+            return_probabilities: If True, return (labels, probabilities), else just labels
         Returns:
-            Binary classifications (0 or 1)
+            Binary classifications (0 or 1) or tuple of (labels, probabilities)
         """
         with torch.no_grad():
             # Debug: Print input statistics (only if debug=True)
@@ -184,33 +185,54 @@ class SemanticBoundaryTrainer:
                 if debug:
                     print(f"Model outputs - Shape: {outputs.shape}, Sample values: {outputs[:5] if len(outputs) > 0 else outputs}")
                 
-                # For 2-class output, take argmax to get class predictions
+                # For 2-class output, get both probabilities and predictions
                 if len(outputs.shape) > 1 and outputs.shape[1] == 2:
+                    probabilities = torch.softmax(outputs, dim=1)[:, 1]  # Get positive class probability
                     _, predicted = torch.max(outputs.data, 1)
-                    result = predicted.cpu().numpy()
+                    labels = predicted.cpu().numpy()
+                    probs = probabilities.cpu().numpy()
+                    
                     if debug:
-                        print(f"2-class prediction - Unique classes: {np.unique(result)}, Counts: {np.bincount(result)}")
-                    return result
+                        print(f"2-class prediction - Unique classes: {np.unique(labels)}, Counts: {np.bincount(labels)}")
+                        print(f"Probabilities range: {probs.min():.3f} - {probs.max():.3f}")
+                        
+                    if return_probabilities:
+                        return labels, probs
+                    return labels
                 else:
-                    # Single output case
+                    # Single output case with sigmoid
                     if len(outputs.shape) > 1:
                         outputs = outputs.squeeze()
-                    predictions = torch.sigmoid(outputs)
-                    result = (predictions > 0.5).cpu().numpy().astype(int)
+                    probabilities = torch.sigmoid(outputs)
+                    labels = (probabilities > 0.5).cpu().numpy().astype(int)
+                    probs = probabilities.cpu().numpy()
+                    
                     if debug:
-                        print(f"Single output prediction - Raw outputs: {outputs[:5]}, Sigmoid: {predictions[:5]}, Final: {result[:5]}")
-                        print(f"Classification result - Unique classes: {np.unique(result)}, Counts: {np.bincount(result)}")
-                    return result
+                        print(f"Single output prediction - Raw outputs: {outputs[:5]}, Sigmoid: {probabilities[:5]}, Final: {labels[:5]}")
+                        print(f"Classification result - Unique classes: {np.unique(labels)}, Counts: {np.bincount(labels)}")
+                        print(f"Probabilities range: {probs.min():.3f} - {probs.max():.3f}")
+                        
+                    if return_probabilities:
+                        return labels, probs
+                    return labels
             else:
                 # Already in latent space format
                 outputs = self.predictor(images)
                 if len(outputs.shape) > 1 and outputs.shape[1] == 2:
+                    probabilities = torch.softmax(outputs, dim=1)[:, 1]
                     _, predicted = torch.max(outputs.data, 1)
-                    return predicted.cpu().numpy()
+                    labels = predicted.cpu().numpy()
+                    probs = probabilities.cpu().numpy()
                 else:
                     if len(outputs.shape) > 1:
                         outputs = outputs.squeeze()
-                    return (torch.sigmoid(outputs) > 0.5).cpu().numpy().astype(int)
+                    probabilities = torch.sigmoid(outputs)
+                    labels = (probabilities > 0.5).cpu().numpy().astype(int)
+                    probs = probabilities.cpu().numpy()
+                
+                if return_probabilities:
+                    return labels, probs
+                return labels
     
     def collect_training_data(self, 
                             noise_vectors: np.ndarray, 
@@ -453,37 +475,37 @@ class SemanticBoundaryTrainer:
     
     def train_uspace_boundary(self, uspace_dir: str, iteration: int, output_dir: str) -> dict:
         """
-        Train SVM boundary in TRUE U-Space and create controlled data
+        Train SVM boundary in U-Space and create controlled data
         
         Args:
-            uspace_dir: Directory containing TRUE U-Space data files
+            uspace_dir: Directory containing U-Space data files
             iteration: Current iteration number
             output_dir: Output directory for results
             
         Returns:
             Dictionary with boundary information
         """
-        logging.info(f"Training semantic boundary in TRUE U-Space for iteration {iteration}...")
+        logging.info(f"Training semantic boundary in U-Space for iteration {iteration}...")
         
-        # Load TRUE U-Space data for the control time (t=0.2)
+        # Load U-Space data for the control time (t=0.2)
         control_time = 0.2  # Default control time
-        uspace_file = os.path.join(uspace_dir, f'true_uspace_t_{control_time:.2f}.npy')
+        uspace_file = os.path.join(uspace_dir, f'uspace_t_{control_time:.2f}.npy')
         
         if not os.path.exists(uspace_file):
-            logging.error(f"TRUE U-Space file not found: {uspace_file}")
+            logging.error(f"U-Space file not found: {uspace_file}")
             # Try to find any available uspace file
             import glob
-            available_files = glob.glob(os.path.join(uspace_dir, 'true_uspace_t_*.npy'))
+            available_files = glob.glob(os.path.join(uspace_dir, 'uspace_t_*.npy'))
             if available_files:
                 uspace_file = available_files[0]
-                logging.info(f"Using available TRUE U-Space file: {uspace_file}")
+                logging.info(f"Using available U-Space file: {uspace_file}")
             else:
-                raise FileNotFoundError(f"No TRUE U-Space files found in {uspace_dir}")
+                raise FileNotFoundError(f"No U-Space files found in {uspace_dir}")
         
-        # Load TRUE U-Space data
-        logging.info(f"Loading TRUE U-Space data from: {uspace_file}")
+        # Load U-Space data
+        logging.info(f"Loading U-Space data from: {uspace_file}")
         uspace_data = np.load(uspace_file)
-        logging.info(f"Loaded TRUE U-Space data shape: {uspace_data.shape}")
+        logging.info(f"Loaded U-Space data shape: {uspace_data.shape}")
         
         # We need to get the corresponding labels for these U-Space features
         # Load semantic data to get labels
@@ -509,13 +531,13 @@ class SemanticBoundaryTrainer:
             # Load and combine labels from semantic classification
             labels = self._load_labels_from_semantic_files(semantic_files, len(uspace_data))
         
-        logging.info(f"Using {len(labels)} labels for TRUE U-Space boundary training")
+        logging.info(f"Using {len(labels)} labels for U-Space boundary training")
         logging.info(f"Label distribution: Positive: {np.sum(labels == 1)}, Negative: {np.sum(labels == 0)}")
         
-        # Train SVM boundary in TRUE U-Space
-        boundary_path = os.path.join(output_dir, f'true_uspace_boundary_iter_{iteration}.pkl')
+        # Train SVM boundary in U-Space
+        boundary_path = os.path.join(output_dir, f'uspace_boundary_iter_{iteration}.pkl')
         
-        boundary_vector, svm_accuracy, controlled_path = self.train_true_uspace_boundary(
+        boundary_vector, svm_accuracy, controlled_path = self.train_uspace_boundary_data(
             uspace_data=uspace_data,
             labels=labels,
             save_path=boundary_path,
@@ -564,14 +586,14 @@ class SemanticBoundaryTrainer:
             random_labels = np.random.randint(0, 2, remaining)
             return np.array(all_labels + random_labels.tolist())
     
-    def train_true_uspace_boundary(self, uspace_data: np.ndarray, labels: np.ndarray,
+    def train_uspace_boundary_data(self, uspace_data: np.ndarray, labels: np.ndarray,
                                   save_path: Optional[str] = None, time_point: float = 0.2,
                                   control_strength: float = 1.0) -> Tuple[np.ndarray, float, str]:
         """
-        Train SVM boundary in TRUE U-Space and create controlled data
+        Train SVM boundary in U-Space and create controlled data
         
         Args:
-            uspace_data: TRUE U-Space representations from UNet bottleneck (batch, channels, height, width)
+            uspace_data: U-Space representations from UNet bottleneck (batch, channels, height, width)
             labels: Binary labels (0 or 1) 
             save_path: Path to save boundary
             time_point: Time point for U-Space
@@ -580,17 +602,17 @@ class SemanticBoundaryTrainer:
         Returns:
             Tuple of (boundary_vector, accuracy, controlled_data_path)
         """
-        logging.info("Training semantic boundary in TRUE U-Space...")
+        logging.info("Training semantic boundary in U-Space...")
         
-        # Flatten TRUE U-Space data for SVM (if needed)
+        # Flatten U-Space data for SVM (if needed)
         if len(uspace_data.shape) == 4:  # (batch, channels, height, width)
             original_shape = uspace_data.shape[1:]
             uspace_flattened = uspace_data.reshape(uspace_data.shape[0], -1)
-            logging.info(f"Flattened TRUE U-Space from {uspace_data.shape} to {uspace_flattened.shape}")
+            logging.info(f"Flattened U-Space from {uspace_data.shape} to {uspace_flattened.shape}")
         elif len(uspace_data.shape) == 3:  # (batch, channels, dim)
             original_shape = uspace_data.shape[1:]
             uspace_flattened = uspace_data.reshape(uspace_data.shape[0], -1)
-            logging.info(f"Flattened TRUE U-Space from {uspace_data.shape} to {uspace_flattened.shape}")
+            logging.info(f"Flattened U-Space from {uspace_data.shape} to {uspace_flattened.shape}")
         else:
             uspace_flattened = uspace_data
             original_shape = None
@@ -603,27 +625,27 @@ class SemanticBoundaryTrainer:
             use_incremental=True
         )
         
-        # Reshape boundary back to original TRUE U-Space shape if needed
+        # Reshape boundary back to original U-Space shape if needed
         if original_shape is not None:
             boundary_reshaped = boundary_vector.reshape(original_shape)
         else:
             boundary_reshaped = boundary_vector
         
-        # Create controlled TRUE U-Space data
+        # Create controlled U-Space data
         positive_uspace = uspace_data + control_strength * boundary_reshaped[None, ...]
         negative_uspace = uspace_data - control_strength * boundary_reshaped[None, ...]
         
         controlled_data = {
-            'original_true_uspace': uspace_data,
-            'positive_true_uspace': positive_uspace,
-            'negative_true_uspace': negative_uspace,
+            'original_uspace': uspace_data,
+            'positive_uspace': positive_uspace,
+            'negative_uspace': negative_uspace,
             'labels': labels,
             'boundary_vector': boundary_reshaped,
             'boundary_vector_flat': boundary_vector,
             'control_strength': control_strength,
             'time_point': time_point,
             'svm_accuracy': svm_accuracy,
-            'is_true_uspace': True,
+            'is_uspace': True,
             'bottleneck_features': True
         }
         
@@ -631,10 +653,10 @@ class SemanticBoundaryTrainer:
         controlled_path = None
         if save_path:
             output_dir = os.path.dirname(save_path)
-            controlled_path = os.path.join(output_dir, f'controlled_true_uspace_t_{time_point:.2f}.pkl')
+            controlled_path = os.path.join(output_dir, f'controlled_uspace_t_{time_point:.2f}.pkl')
             with open(controlled_path, 'wb') as f:
                 pickle.dump(controlled_data, f)
-            logging.info(f"Controlled TRUE U-Space data saved to: {controlled_path}")
+            logging.info(f"Controlled U-Space data saved to: {controlled_path}")
         
-        logging.info(f"Trained TRUE U-Space semantic boundary with accuracy: {svm_accuracy:.3f}")
+        logging.info(f"Trained U-Space semantic boundary with accuracy: {svm_accuracy:.3f}")
         return boundary_reshaped, svm_accuracy, controlled_path

@@ -21,6 +21,19 @@ sys.path.append(os.path.join(os.path.dirname(__file__), 'ImageGeneration'))
 
 from semantic_boundary_trainer import SemanticBoundaryTrainer
 
+# Import adaptive control strength functions
+try:
+    from uspace_train import get_adaptive_control_strength, determine_target_direction, print_k_statistics
+except ImportError as e:
+    logging.warning(f"Adaptive control functions not found: {e}")
+    # Define fallback functions
+    def get_adaptive_control_strength(probs, labels, base_strength=1.0):
+        return base_strength
+    def determine_target_direction(labels):
+        return 1.0
+    def print_k_statistics(k_values):
+        pass
+
 # Import ImageGeneration modules with try-except for development
 try:
     import run_lib_reflow
@@ -424,7 +437,7 @@ def generate_data_from_z0(config, workdir, num_samples):
     score_model, inverse_scaler = load_model_and_config(config, checkpoint_path)
     
     # Use adaptive batch size for generation based on available memory
-    max_batch_size = min(config.semantic.semantic_batch_size, 8)  # Max 8 samples at a time
+    max_batch_size = min(config.semantic.semantic_batch_size, 4)  # Max 8 samples at a time
     generation_batch_size = max_batch_size
     
     # Configure sampling with adaptive batch size
@@ -719,13 +732,14 @@ def generate_semantic_data_pairs(config,
         noise_batch = z0_tensor[i:end_idx]
         image_batch = z1_tensor[i:end_idx]
         
-        # Get semantic classifications (enable debug for first batch only)
-        labels = semantic_trainer.classify_images(image_batch, debug=(i == 0))
+        # Get semantic classifications with probabilities (enable debug for first batch only)
+        labels, probabilities = semantic_trainer.classify_images(image_batch, debug=(i == 0), return_probabilities=True)
         
         # Save batch data to disk immediately to avoid memory buildup
         batch_num = i // batch_size + 1
         batch_noise_path = os.path.join(pt_semantic_dir, f'noise_batch_{batch_num}.pt')
         batch_images_path = os.path.join(pt_semantic_dir, f'images_batch_{batch_num}.pt')
+        batch_probs_path = os.path.join(pt_semantic_dir, f'probabilities_batch_{batch_num}.pt')
         
         # Robust save with error handling and memory optimization
         try:
@@ -736,6 +750,7 @@ def generate_semantic_data_pairs(config,
             # Save with pickle protocol 4 and compression disabled
             torch.save(noise_batch_cpu, batch_noise_path, pickle_protocol=4, _use_new_zipfile_serialization=False)
             torch.save(image_batch_cpu, batch_images_path, pickle_protocol=4, _use_new_zipfile_serialization=False)
+            torch.save(torch.tensor(probabilities), batch_probs_path, pickle_protocol=4, _use_new_zipfile_serialization=False)
             
             # Clean up CPU tensors immediately
             del noise_batch_cpu, image_batch_cpu
@@ -747,14 +762,18 @@ def generate_semantic_data_pairs(config,
             # Fallback: save individual samples in the batch
             batch_noise_dir = os.path.join(pt_semantic_dir, f'noise_batch_{batch_num}')
             batch_images_dir = os.path.join(pt_semantic_dir, f'images_batch_{batch_num}')
+            batch_probs_dir = os.path.join(pt_semantic_dir, f'probabilities_batch_{batch_num}')
             os.makedirs(batch_noise_dir, exist_ok=True)
             os.makedirs(batch_images_dir, exist_ok=True)
+            os.makedirs(batch_probs_dir, exist_ok=True)
             
             for idx in range(len(noise_batch)):
                 individual_noise_path = os.path.join(batch_noise_dir, f'sample_{idx}.pt')
                 individual_image_path = os.path.join(batch_images_dir, f'sample_{idx}.pt')
+                individual_prob_path = os.path.join(batch_probs_dir, f'sample_{idx}.pt')
                 torch.save(noise_batch[idx:idx+1].cpu().contiguous(), individual_noise_path, pickle_protocol=4)
                 torch.save(image_batch[idx:idx+1].cpu().contiguous(), individual_image_path, pickle_protocol=4)
+                torch.save(torch.tensor([probabilities[idx]]), individual_prob_path, pickle_protocol=4)
         
         # Count classified images but don't save individual files to save space
         for j, label in enumerate(labels):
@@ -924,17 +943,19 @@ def continue_semantic_classification(config, workdir: str, interfacegan_model_pa
     elif z1_tensor.max() > 1.0:
         z1_tensor = z1_tensor / 255.0
     
-    # Process in batches - just collect labels
+    # Process in batches - collect labels and probabilities
     all_labels = []
+    all_probabilities = []
     batch_size = config.semantic.semantic_batch_size
     
     for i in tqdm(range(0, len(z0_tensor), batch_size), desc="Classifying"):
         end_idx = min(i + batch_size, len(z0_tensor))
         image_batch = z1_tensor[i:end_idx].to(config.device)
         
-        # Classify without debug output (except first batch)
-        labels = semantic_trainer.classify_images(image_batch, debug=(i == 0))
+        # Classify with probabilities (debug for first batch only)
+        labels, probabilities = semantic_trainer.classify_images(image_batch, debug=(i == 0), return_probabilities=True)
         all_labels.extend(labels)
+        all_probabilities.extend(probabilities)
         
         # Clear GPU memory
         del image_batch
@@ -1040,6 +1061,7 @@ def continue_semantic_classification(config, workdir: str, interfacegan_model_pa
         'z0': z0_numpy,
         'z1': z1_numpy,
         'labels': all_labels,
+        'probabilities': all_probabilities,
         'boundary': boundary,
         'config': config,
         'metadata': {
@@ -1060,13 +1082,65 @@ def continue_semantic_classification(config, workdir: str, interfacegan_model_pa
     
     return semantic_data_path
 
-def train_reflow_with_uspace_drift(config, workdir, z0_data, z1_data, labels, boundary_vector):
+def train_reflow_with_uspace_drift(config, workdir, z0_data, z1_data, labels, boundary_vector, probabilities=None):
     """
     Train reflow with u-space drift at t=0.25
     在训练时对 zt 添加语义控制偏移: zt' = zt + k*v
     损失函数还是 L(z1, z_hat)，但UNet的输入被修改了
+    
+    Args:
+        probabilities: Classifier confidence probabilities for adaptive control strength
     """
     logging.info("Training reflow with u-space drift modification...")
+    
+    # Calculate adaptive control strengths if probabilities are available
+    k_values = None
+    if probabilities is not None:
+        logging.info("Computing adaptive control strengths based on classifier confidence...")
+        
+        # Get base strength from config or use default
+        base_strength = config.get('semantic_control', {}).get('base_strength', 1.0)
+        
+        # Calculate adaptive strengths for each sample
+        k_values = []
+        target_directions = []
+        
+        # For semantic control, typically we want to enhance the attribute (move towards positive)
+        desired_label = 1  # Enhance attribute by default, could be configurable
+        
+        for i, (prob, label) in enumerate(zip(probabilities, labels)):
+            # Get target direction based on current and desired labels
+            direction = determine_target_direction(label, desired_label)
+            
+            # Get adaptive strength based on confidence and direction
+            k = get_adaptive_control_strength(prob, direction, base_strength=base_strength)
+            
+            k_values.append(k)
+            target_directions.append(direction)
+        
+        k_values = np.array(k_values)
+        target_directions = np.array(target_directions)
+        
+        # Log adaptive strength statistics
+        print_k_statistics(k_values, probabilities, epoch=0)
+        
+        # Log to WandB
+        wandb.log({
+            "adaptive_control/mean_strength": np.mean(k_values),
+            "adaptive_control/std_strength": np.std(k_values),
+            "adaptive_control/min_strength": np.min(k_values),
+            "adaptive_control/max_strength": np.max(k_values),
+            "adaptive_control/num_positive_direction": np.sum(target_directions > 0),
+            "adaptive_control/num_negative_direction": np.sum(target_directions < 0)
+        })
+        
+        logging.info(f"Adaptive strengths: mean={np.mean(k_values):.3f}, std={np.std(k_values):.3f}")
+    else:
+        logging.info("No probabilities provided, using fixed control strength")
+        base_strength = config.get('semantic_control', {}).get('base_strength', 1.0)
+        k_values = np.full(len(labels), base_strength)
+        desired_label = 1  # Default to enhance attribute
+        target_directions = [determine_target_direction(label, desired_label) for label in labels]
     
     # Create checkpoint directory for training
     training_checkpoint_dir = os.path.join(workdir, 'semantic_training', 'checkpoints')
@@ -1093,12 +1167,18 @@ def train_reflow_with_uspace_drift(config, workdir, z0_data, z1_data, labels, bo
         'noise': z0_data,
         'data': z1_data,  # Original z1, no modification needed
         'labels': labels,
+        'probabilities': probabilities,
         'boundary_vector': boundary_vector,
+        'adaptive_strengths': k_values,
+        'target_directions': target_directions,
         'control_time': 0.25,  # t=0.25时刻应用控制
         'metadata': {
             'total_samples': len(z0_data),
             'boundary_norm': np.linalg.norm(boundary_vector) if boundary_vector is not None else None,
-            'training_type': 'uspace_drift'
+            'training_type': 'uspace_drift_adaptive' if probabilities is not None else 'uspace_drift_fixed',
+            'adaptive_control': probabilities is not None,
+            'mean_strength': np.mean(k_values) if k_values is not None else None,
+            'std_strength': np.std(k_values) if k_values is not None else None
         }
     }
     
@@ -1243,6 +1323,7 @@ def train_semantic_reflow(config, workdir: str, semantic_data_path: str):
             z0_data_chunks = []
             z1_data_chunks = []
             labels = file_index['labels']
+            probabilities = file_index.get('probabilities', None)
             
             chunk_size = 3  # Load 3 batches at a time
             for i in range(0, len(file_index['noise_files']), chunk_size):
@@ -1265,6 +1346,8 @@ def train_semantic_reflow(config, workdir: str, semantic_data_path: str):
             z0_data = torch.cat(z0_data_chunks, dim=0)
             z1_data = torch.cat(z1_data_chunks, dim=0)
             labels = np.array(labels)
+            if probabilities is not None:
+                probabilities = np.array(probabilities)
             
             del z0_data_chunks, z1_data_chunks
         else:
@@ -1272,11 +1355,13 @@ def train_semantic_reflow(config, workdir: str, semantic_data_path: str):
             z0_data = semantic_data['z0']
             z1_data = semantic_data['z1']
             labels = semantic_data['labels']
+            probabilities = semantic_data.get('probabilities', None)
     else:
         # Extract data from semantic data
         z0_data = semantic_data['z0']
         z1_data = semantic_data['z1']
         labels = semantic_data['labels']
+        probabilities = semantic_data.get('probabilities', None)
     
     # Save original data statistics before processing
     original_stats_path = os.path.join(progress_dir, 'original_data_stats.pkl')
@@ -1317,6 +1402,10 @@ def train_semantic_reflow(config, workdir: str, semantic_data_path: str):
         z0_data = z0_data[balanced_indices]
         z1_data = z1_data[balanced_indices]
         labels = labels[balanced_indices]
+        if probabilities is not None:
+            if isinstance(probabilities, np.ndarray):
+                probabilities = torch.from_numpy(probabilities)
+            probabilities = probabilities[balanced_indices]
         
         logging.info(f"Balanced dataset: {len(z0_data)} samples ({torch.sum(labels == 1)} positive, {torch.sum(labels == 0)} negative)")
         
@@ -1356,7 +1445,8 @@ def train_semantic_reflow(config, workdir: str, semantic_data_path: str):
     balanced_data = {
         'data': z1_normalized.numpy() if torch.is_tensor(z1_normalized) else z1_normalized,
         'noise': z0_normalized.numpy() if torch.is_tensor(z0_normalized) else z0_normalized,
-        'labels': labels.numpy() if torch.is_tensor(labels) else labels
+        'labels': labels.numpy() if torch.is_tensor(labels) else labels,
+        'probabilities': probabilities.numpy() if torch.is_tensor(probabilities) and probabilities is not None else probabilities
     }
     
     with open(balanced_data_path, 'wb') as f:
