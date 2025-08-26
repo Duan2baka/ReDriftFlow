@@ -129,39 +129,77 @@ class USpaceExtractor:
 
         
     def _sample_to_time(self, z0: torch.Tensor, target_time: float) -> torch.Tensor:
+        """Sample from z0 to target_time using Euler method"""
         if self.score_model is None:
             raise ValueError("Model not loaded!")
-            
-        step_size = 0.1
-        current_time = 0.0
-        x = z0.detach().clone()
         
-        while current_time < target_time:
-            next_time = min(current_time + step_size, 
-                        np.ceil(target_time / step_size) * step_size)
+        # Use the same approach as the reference sampling code
+        with torch.no_grad():
+            x = z0.detach().clone()
             
-            if next_time > target_time:
-                next_time = np.ceil(target_time / step_size) * step_size
+            # Check inputs
+            if torch.isnan(x).any():
+                print(f"Input z0 has NaN!")
+                return torch.zeros_like(x)
+            
+            # Get model function (same as reference)
+            model_fn = mutils.get_model_fn(self.score_model, train=False)
+            
+            # Calculate number of steps based on target_time
+            # Use similar discretization as reference code
+            eps = 1e-3
+            N_steps = max(1, int(target_time * 100))  # Scale steps with target_time
+            dt = (target_time - eps) / N_steps
+            
+            #print(f"Sampling to t={target_time}, N_steps={N_steps}, dt={dt}")
+            
+            current_time = eps
+            for i in range(N_steps):
+                # Current time (same scaling as reference: t*999)
+                t = torch.ones(x.shape[0], device=x.device) * current_time
                 
-            dt = next_time - current_time
-            t_tensor = torch.ones(x.shape[0], device=x.device) * current_time
-            
-            with torch.no_grad():
-                pred = self.score_model(x, t_tensor * 999)
-            
-            # Euler step
-            x = x + pred * dt
-            current_time = next_time
-            
-            if current_time >= target_time:
-                break
+                # Get prediction
+                pred = model_fn(x, t * 999)
                 
-        return x
+                # Debug: check for NaN
+                if torch.isnan(pred).any():
+                    print(f"Model prediction has NaN at t={current_time}")
+                    print(f"Input x stats: min={x.min():.4f}, max={x.max():.4f}")
+                    print(f"Input x has NaN: {torch.isnan(x).any()}")
+                    return torch.zeros_like(x)
+                
+                # Apply sigma correction (from reference code)
+                if hasattr(self, 'sde') and hasattr(self.sde, 'sigma_t'):
+                    sigma_t = self.sde.sigma_t(current_time)
+                    noise_scale = getattr(self.sde, 'noise_scale', 1.0)
+                    
+                    pred_sigma = pred + (sigma_t**2)/(2*(noise_scale**2)*((1.-current_time)**2)) * \
+                                (0.5 * current_time * (1.-current_time) * pred - 0.5 * (2.-current_time) * x.detach().clone())
+                    
+                    # Euler step with noise
+                    x = x.detach().clone() + pred_sigma * dt + \
+                        sigma_t * np.sqrt(dt) * torch.randn_like(pred_sigma).to(x.device)
+                else:
+                    # Simple Euler step (deterministic)
+                    x = x.detach().clone() + pred * dt
+                
+                current_time += dt
+                
+                # Check for NaN after update
+                if torch.isnan(x).any():
+                    print(f"x becomes NaN at step {i}, t={current_time}")
+                    return torch.zeros_like(x)
+            
+            return x
 
         
     def _extract_bottleneck_features(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         """Extract bottleneck features from NCSNpp using forward hooks"""
         bottleneck_features = []
+        #print(f"Input x stats: min={x.min():.4f}, max={x.max():.4f}, mean={x.mean():.4f}, std={x.std():.4f}")
+        #print(f"Input x has NaN: {torch.isnan(x).any()}")
+        #print(f"Input t: {t}")
+        #print(f"Input t has NaN: {torch.isnan(t).any()}")
         
         def hook_fn(module, input, output):
             bottleneck_features.append(output.clone())
@@ -194,7 +232,7 @@ class USpaceExtractor:
         try:
             with torch.no_grad():
                 _ = self.score_model(x, t)
-                
+                #print(bottleneck_features)
                 if bottleneck_features:
                     features = bottleneck_features[0]
                     # Pool spatial dimensions if needed
@@ -258,12 +296,16 @@ class USpaceExtractor:
                     for t in time_points:
                         # Generate xt using ODE sampling
                         xt_sample = self._sample_to_time(z0_sample, t)
-                        
+                        #print(torch.isnan(z0_sample).any())
+                        #print(torch.isnan(xt_sample).any())
                         # Extract U-Space from UNet bottleneck
                         uspace_sample = self._extract_bottleneck_features(
                             xt_sample, 
                             torch.ones(1, device=self.device) * t
                         )
+                        if torch.isnan(uspace_sample).any():
+                            logging.warning(f"NaN detected in U-Space at t={t}, sample {sample_idx}")
+                            uspace_sample = torch.zeros_like(uspace_sample)
                         
                         sample_results.append(uspace_sample.cpu())
                     

@@ -32,6 +32,7 @@ def get_config():
     sampling.init_noise_scale = 1.0
     sampling.use_ode_sampler = 'rk45'
     sampling.ode_tol = 1e-3  # Relaxed for speed
+    sampling.sigma_variance = 0.0
     
     # Data
     config.data = data = ml_collections.ConfigDict()
