@@ -126,327 +126,107 @@ class USpaceExtractor:
         
         logging.info(f"Model loaded successfully! Training step: {state['step']}")
         logging.info(f"Model moved to device: {self.device}")
-        
-    def extract_uspace_from_unet(self, z0_data: np.ndarray, z1_data: np.ndarray, control_time: float,
-                                     batch_size: int = 1, save_interval: int = 100,
-                                     temp_save_dir: str = None, 
-                                     return_path: bool = False) -> np.ndarray:
-        """
-        Extract U-Space representations from UNet bottleneck features
-        
-        Process:
-        1. Interpolate: xt = (1-t) * z0 + t * z1
-        2. Forward through UNet encoder to bottleneck
-        3. Extract bottleneck features as U-Space
-        
-        Args:
-            z0_data: noise vectors (batch, channels, height, width)
-            z1_data: target images (batch, channels, height, width)
-            control_time: time t for extraction (0.0 to 1.0)
-            batch_size: batch size for processing (reduced for memory safety)
-            save_interval: save intermediate results every N batches
-            temp_save_dir: directory to save temporary results
-            return_path: if True, return file path instead of loading data to memory
-            
-        Returns:
-            uspace_data: U-Space features from UNet bottleneck (or file path if return_path=True)
-        """
-        logging.info(f"Extracting U-Space at t={control_time} from UNet bottleneck features...")
-        logging.info(f"Using batch size: {batch_size}, save interval: {save_interval}")
-        
-        if self.score_model is None:
-            raise ValueError("Model not loaded! Call load_model() first.")
-            
-        # Convert to tensor if needed
-        if isinstance(z0_data, np.ndarray):
-            z0_tensor = torch.from_numpy(z0_data)
-        else:
-            z0_tensor = z0_data
-            
-        if isinstance(z1_data, np.ndarray):
-            z1_tensor = torch.from_numpy(z1_data)
-        else:
-            z1_tensor = z1_data
-            
-        num_samples = len(z0_tensor)
-        num_batches = (num_samples + batch_size - 1) // batch_size
-        
-        # Create temporary save directory if not provided
-        if temp_save_dir is None:
-            temp_save_dir = f"temp_uspace_t_{control_time:.2f}"
-        os.makedirs(temp_save_dir, exist_ok=True)
-        
-        all_uspace = []
-        temp_file_counter = 0
-        
-        # Clear GPU cache before starting
-        torch.cuda.empty_cache()
-        
-        for batch_idx in range(num_batches):
-            start_idx = batch_idx * batch_size
-            end_idx = min(start_idx + batch_size, num_samples)
-            z0_batch = z0_tensor[start_idx:end_idx].to(self.device)
-            z1_batch = z1_tensor[start_idx:end_idx].to(self.device)
-            
-            try:
-                with torch.no_grad():
-                    # Step 1: Generate xt from z0 using ODE sampling to control_time (consistent with inference)
-                    # Use the same sampling logic as in training/inference
-                    xt_batch = self._sample_to_time(z0_batch, control_time)
-                    
-                    # Step 2: Extract U-Space from UNet bottleneck
-                    uspace_batch = self._extract_bottleneck_features(xt_batch, 
-                                                                   torch.ones(len(xt_batch), device=self.device) * control_time)
-                    
-                all_uspace.append(uspace_batch.cpu())
-                
-                # Force garbage collection after each batch
-                del uspace_batch, xt_batch, z0_batch, z1_batch
-                torch.cuda.empty_cache()
-                gc.collect()
-                
-            except RuntimeError as e:
-                if "out of memory" in str(e):
-                    logging.error(f"GPU out of memory at batch {batch_idx}. Try reducing batch size further.")
-                    # Clear cache and try to continue
-                    torch.cuda.empty_cache()
-                    gc.collect()
-                    raise
-                else:
-                    raise
-            
-            # Save intermediate results every save_interval batches
-            if (batch_idx + 1) % save_interval == 0 or batch_idx == num_batches - 1:
-                if all_uspace:  # Only save if we have data
-                    # Concatenate current batch
-                    temp_tensor = torch.cat(all_uspace, dim=0)
-                    temp_data = temp_tensor.cpu().numpy()
-                    
-                    # Save to temporary file
-                    temp_file = os.path.join(temp_save_dir, f"temp_chunk_{temp_file_counter:04d}.npy")
-                    np.save(temp_file, temp_data)
-                    
-                    logging.info(f"Saved temporary chunk {temp_file_counter} ({len(temp_data)} samples) to {temp_file}")
-                    
-                    # Clear memory
-                    del temp_tensor, temp_data, all_uspace
-                    all_uspace = []
-                    temp_file_counter += 1
-                    
-                    # Force cleanup
-                    torch.cuda.empty_cache()
-                    gc.collect()
-            
-        # Create final result file without loading everything into memory
-        logging.info("Creating final result file with streaming concatenation...")
-        
-        # First pass: get total size and validate files
-        total_samples = 0
-        valid_files = []
-        sample_shape = None
-        
-        for i in range(temp_file_counter):
-            temp_file = os.path.join(temp_save_dir, f"temp_chunk_{i:04d}.npy")
-            if os.path.exists(temp_file):
-                # Load header only to get shape info
-                chunk_data = np.load(temp_file, mmap_mode='r')  # Memory-map mode
-                if sample_shape is None:
-                    sample_shape = chunk_data.shape[1:]  # Store sample shape
-                total_samples += chunk_data.shape[0]
-                valid_files.append((temp_file, chunk_data.shape[0]))
-                logging.info(f"Found chunk {i} with {chunk_data.shape[0]} samples")
-                del chunk_data  # Release memory map
-        
-        if not valid_files:
-            raise RuntimeError("No valid temporary files found")
-        
-        # Create final output file
-        final_shape = (total_samples,) + sample_shape
-        logging.info(f"Creating final output file with shape: {final_shape}")
-        
-        final_result_file = os.path.join(temp_save_dir, "final_uspace_result.npy")
-        final_array = np.memmap(final_result_file, dtype=np.float32, mode='w+', shape=final_shape)
-        
-        # Second pass: copy data chunk by chunk
-        current_idx = 0
-        for temp_file, chunk_size in valid_files:
-            logging.info(f"Copying chunk from {temp_file}...")
-            
-            # Load chunk data
-            chunk_data = np.load(temp_file)
-            
-            # Copy to final array
-            end_idx = current_idx + chunk_size
-            final_array[current_idx:end_idx] = chunk_data
-            
-            current_idx = end_idx
-            
-            # Clean up immediately
-            del chunk_data
-            os.remove(temp_file)
-            gc.collect()
-            
-            logging.info(f"Copied chunk, progress: {current_idx}/{total_samples}")
-        
-        # Flush the memmap to ensure data is written
-        del final_array
-        
-        logging.info(f"Final U-Space result saved to: {final_result_file}")
-        
-        # Return based on what the caller needs
-        if return_path:
-            # Return file path for memory efficiency
-            return final_result_file
-        else:
-            # Load the result for backwards compatibility
-            uspace_data = np.load(final_result_file)
-            # Clean up the file since we loaded it
-            os.remove(final_result_file)
-            
-            # Clean up temporary directory
-            try:
-                os.rmdir(temp_save_dir)
-            except OSError:
-                logging.warning(f"Could not remove temporary directory {temp_save_dir}")
-            
-            logging.info(f"Extracted U-Space data shape: {uspace_data.shape}")
-            return uspace_data
+
         
     def _sample_to_time(self, z0: torch.Tensor, target_time: float) -> torch.Tensor:
-        """
-        Sample from z0 to target_time using ODE with same steps as config
-        
-        Args:
-            z0: Initial noise tensor
-            target_time: Target time (0.0 to 1.0)
-            
-        Returns:
-            xt: Tensor at target_time using ODE steps
-        """
         if self.score_model is None:
             raise ValueError("Model not loaded!")
             
-        # Get sample_N from config (default 10 for fast sampling)
-        N = getattr(self.config.sampling, 'sample_N', 10)
-        eps = 1e-3
-        
-        # Use euler sampling for consistency and speed
-        dt = target_time / N
+        step_size = 0.1
+        current_time = 0.0
         x = z0.detach().clone()
         
-        model_fn = mutils.get_model_fn(self.score_model, train=False)
-        shape = z0.shape
-        device = z0.device
-        
-        # ODE steps from 0 to target_time
-        for i in range(N):
-            if target_time <= eps:
-                break
-                
-            num_t = i / N * (target_time - eps) + eps
-            if num_t >= target_time:
-                break
-                
-            t = torch.ones(shape[0], device=device) * num_t
+        while current_time < target_time:
+            next_time = min(current_time + step_size, 
+                        np.ceil(target_time / step_size) * step_size)
             
-            # Get model prediction
-            pred = model_fn(x, t * 999)  # Scale time for model
+            if next_time > target_time:
+                next_time = np.ceil(target_time / step_size) * step_size
+                
+            dt = next_time - current_time
+            t_tensor = torch.ones(x.shape[0], device=x.device) * current_time
+            
+            with torch.no_grad():
+                pred = self.score_model(x, t_tensor * 999)
             
             # Euler step
-            x = x.detach().clone() + pred * dt
+            x = x + pred * dt
+            current_time = next_time
             
+            if current_time >= target_time:
+                break
+                
         return x
+
         
     def _extract_bottleneck_features(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        """
-        Extract bottleneck features from UNet using forward hooks
-        
-        Args:
-            x: Input tensor (batch_size, channels, height, width)
-            t: Time tensor (batch_size,)
-            
-        Returns:
-            bottleneck_features: UNet bottleneck features as U-Space
-        """
-        # Register forward hook to capture bottleneck features
+        """Extract bottleneck features from NCSNpp using forward hooks"""
         bottleneck_features = []
         
         def hook_fn(module, input, output):
-            # Capture the bottleneck features
             bottleneck_features.append(output.clone())
         
-        # Find the bottleneck layer (middle of the UNet)
-        # For NCSN++ architecture, look for the middle block
-        hook_handle = None
-        target_module = None
-        
-        # Try to find the middle/bottleneck layer
-        if hasattr(self.score_model, 'all_modules'):
-            # For NCSN++ models with all_modules
-            modules = list(self.score_model.all_modules)
-            middle_idx = len(modules) // 2
-            target_module = modules[middle_idx]
-        elif hasattr(self.score_model, 'module_list') or hasattr(self.score_model, 'modules'):
-            # Alternative module access
-            modules = list(self.score_model.modules())
-            # Find conv layers and take one from the middle
-            conv_modules = [m for m in modules if isinstance(m, (torch.nn.Conv2d, torch.nn.ConvTranspose2d))]
-            if conv_modules:
-                middle_idx = len(conv_modules) // 2
-                target_module = conv_modules[middle_idx]
-        
-        if target_module is None:
-            # Fallback: use the entire model output and spatially pool
-            logging.warning("Could not find bottleneck layer, using model output with pooling")
+        # Get model modules
+        try:
+            all_modules = self.score_model.module.all_modules if hasattr(self.score_model, 'module') else self.score_model.all_modules
+            
+            # Find attention layers (ideal bottleneck)
+            attention_indices = [i for i, m in enumerate(all_modules) 
+                            if 'AttnBlockpp' in str(type(m))]
+            
+            if attention_indices:
+                target_module = all_modules[attention_indices[0]]  # Use first attention layer
+            else:
+                # Fallback: use middle of bottleneck range (modules 20-34)
+                target_module = all_modules[27]
+                
+        except:
+            # Final fallback: use model output
             with torch.no_grad():
                 model_output = self.score_model(x, t)
-                # Global average pooling to create bottleneck-like features
-                bottleneck = torch.mean(model_output, dim=[2, 3], keepdim=True)  # (B, C, 1, 1)
-                return bottleneck
+                if len(model_output.shape) == 4:
+                    return torch.mean(model_output, dim=[2, 3], keepdim=True)
+                return model_output
         
-        # Register hook
+        # Register hook and forward pass
         hook_handle = target_module.register_forward_hook(hook_fn)
         
         try:
             with torch.no_grad():
-                # Forward pass to trigger the hook
                 _ = self.score_model(x, t)
                 
                 if bottleneck_features:
-                    # Use the captured features
                     features = bottleneck_features[0]
-                    
-                    # If features are spatial (H, W > 1), pool them to create compact representation
-                    if len(features.shape) == 4 and features.shape[-1] > 1:
-                        # Global average pooling
-                        pooled_features = torch.mean(features, dim=[2, 3], keepdim=True)
-                        return pooled_features
-                    else:
-                        return features
+                    # Pool spatial dimensions if needed
+                    if len(features.shape) == 4 and (features.shape[2] > 1 or features.shape[3] > 1):
+                        return torch.mean(features, dim=[2, 3], keepdim=True)
+                    return features
                 else:
-                    logging.warning("No bottleneck features captured, using fallback")
-                    # Fallback: use spatial pooling of input
-                    return torch.mean(x, dim=[2, 3], keepdim=True)
+                    # Hook failed fallback
+                    model_output = self.score_model(x, t)
+                    if len(model_output.shape) == 4:
+                        return torch.mean(model_output, dim=[2, 3], keepdim=True)
+                    return model_output
                     
         finally:
-            # Clean up hook
             if hook_handle is not None:
                 hook_handle.remove()
+
         
-    def _extract_uspace_all_times(self, z0_data: np.ndarray, z1_data: np.ndarray, 
+    def extract_uspace(self, z0_data: np.ndarray, 
                                   time_points: List[float]) -> List[np.ndarray]:
         """
         Extract U-Space representations for all time points simultaneously
         
         Args:
             z0_data: noise vectors (batch, channels, height, width)
-            z1_data: target images (batch, channels, height, width)
             time_points: list of time points to extract
             
         Returns:
             List of U-Space data arrays, one for each time point
         """
         logging.info(f"Extracting U-Space for {len(time_points)} time points simultaneously...")
+        #print(f"Extracting U-Space for {len(time_points)} time points simultaneously...")
         
         if self.score_model is None:
             raise ValueError("Model not loaded! Call load_model() first.")
@@ -457,10 +237,6 @@ class USpaceExtractor:
         else:
             z0_tensor = z0_data
             
-        if isinstance(z1_data, np.ndarray):
-            z1_tensor = torch.from_numpy(z1_data)
-        else:
-            z1_tensor = z1_data
             
         num_samples = len(z0_tensor)
         batch_size = 1  # Process one sample at a time for memory safety
@@ -473,7 +249,6 @@ class USpaceExtractor:
         
         for sample_idx in range(num_samples):
             z0_sample = z0_tensor[sample_idx:sample_idx+1].to(self.device)
-            z1_sample = z1_tensor[sample_idx:sample_idx+1].to(self.device)
             
             try:
                 with torch.no_grad():
@@ -497,7 +272,7 @@ class USpaceExtractor:
                         all_time_results[i].append(result)
                     
                 # Clean up immediately
-                del z0_sample, z1_sample, sample_results
+                del z0_sample, sample_results
                 torch.cuda.empty_cache()
                 gc.collect()
                     
@@ -515,69 +290,45 @@ class USpaceExtractor:
         for i, time_result_list in enumerate(all_time_results):
             if time_result_list:
                 concatenated = torch.cat(time_result_list, dim=0)
-                final_results.append(concatenated.cpu().numpy())
+                final_results.append(concatenated.cpu().numpy().astype(np.float32))
             else:
-                final_results.append(np.array([]))
+                final_results.append(np.array([], dtype=np.float32))
         
         logging.info(f"Extracted U-Space for {len(time_points)} time points, shapes: {[r.shape for r in final_results]}")
         return final_results
 
-    def process_existing_data_pairs_efficient(self, data_path: str, output_dir: str,
+    def process(self, data_path: str, output_dir: str,
                                    time_points: List[float] = None,
-                                   method: str = 'true_uspace',
                                    checkpoint_path: str = None,
                                    iteration: int = None):
-        """
-        Process existing (z0, z1) pairs to extract TRUE U-Space representations with memory-efficient batch processing
-        
-        Args:
-            data_path: path to existing data pairs file (.pt or .pkl) or directory
-            output_dir: directory to save extracted u-space data
-            time_points: list of time points to extract
-            method: extraction method (only 'true_uspace' supported)
-            checkpoint_path: path to model checkpoint (required for true_uspace)
-            iteration: iteration number for organizing outputs
-        """
         logging.info(f"Processing existing data pairs from: {data_path} (memory-efficient)")
         
-        # If iteration is specified, create iteration-specific subdirectory
         if iteration is not None:
             output_dir = os.path.join(output_dir, f'iteration_{iteration}', 'uspace_extracted')
-        
-        # Default time points if not specified
         if time_points is None:
-            time_points = [0.1, 0.25, 0.5, 0.75]
-            
-        # Create output directory
+            time_points = [0.1, 0.2, 0.3, 0.5]
         os.makedirs(output_dir, exist_ok=True)
+        if checkpoint_path is None:
+            raise ValueError("checkpoint_path required")
+        self.load_model(checkpoint_path)
         
-        # Load model if using true_uspace method
-        if method == 'true_uspace':
-            if checkpoint_path is None:
-                raise ValueError("checkpoint_path required for true_uspace method")
-            self.load_model(checkpoint_path)
-        
-        # Memory-efficient data processing
         if os.path.isdir(data_path):
-            # Handle directory with multiple files - process in batches
-            summary_file = self._process_directory_batch(data_path, output_dir, time_points, method)
+            summary_file = self.process_batch(data_path, output_dir, time_points)
         else:
-            # Handle single file
-            summary_file = self._process_single_file(data_path, output_dir, time_points, method)
+            print("Data path is not a directory")
             
-        logging.info(f"Saved TRUE U-Space extraction summary to: {summary_file}")
-        logging.info("TRUE U-Space extraction completed with memory-efficient processing!")
+        logging.info(f"Saved U-Space extraction summary to: {summary_file}")
+        logging.info("U-Space extraction completed with memory-efficient processing!")
         
         return summary_file
     
-    def _process_directory_batch(self, data_path: str, output_dir: str, time_points: List[float], method: str):
-        """Process directory with multiple data files in memory-efficient batches"""
+    def process_batch(self, data_path: str, output_dir: str, time_points: List[float]):
         logging.info(f"Processing directory in batches: {data_path}")
         
         # Find all data files
         data_files = []
         for file in os.listdir(data_path):
-            if file.endswith('.pt') or file.endswith('.pkl'):
+            if file.startswith('noise') and file.endswith('.pt'):
                 data_files.append(os.path.join(data_path, file))
         
         if not data_files:
@@ -585,10 +336,9 @@ class USpaceExtractor:
         
         logging.info(f"Found {len(data_files)} data files to process")
         
-        # Process files in small batches to save memory
-        batch_size = 8  # Process 8 files at a time
+        batch_size = 4 
         total_samples = 0
-        uspace_results = {t: [] for t in time_points}  # Store file paths for each time point
+        uspace_results = {t: [] for t in time_points} 
         
         num_batches = (len(data_files) + batch_size - 1) // batch_size
         batch_progress = tqdm(range(0, len(data_files), batch_size), desc="Processing data batches for U-Space extraction")
@@ -603,74 +353,27 @@ class USpaceExtractor:
             
             # Collect data from this batch
             z0_batch_list = []
-            z1_batch_list = []
             
             for data_file in batch_files:
                 try:
                     if data_file.endswith('.pt'):
                         data = torch.load(data_file, map_location='cpu')
+                    if isinstance(data, dict) and 'z0' in data:
+                        z0_batch_list.append(data['z0'])
+                    elif isinstance(data, torch.Tensor):
+                        z0_batch_list.append(data)
                     else:
-                        with open(data_file, 'rb') as f:
-                            data = pickle.load(f)
-                    
-                    # Handle different data formats
-                    if isinstance(data, dict):
-                        if 'z0' in data and 'z1' in data:
-                            # Format: {'z0': tensor, 'z1': tensor}
-                            z0_batch_list.append(data['z0'])
-                            z1_batch_list.append(data['z1'])
-                        elif 'z0_batch' in data and 'z1_batch' in data:
-                            # Format: {'z0_batch': tensor, 'z1_batch': tensor, ...}
-                            z0_batch_list.append(data['z0_batch'])
-                            z1_batch_list.append(data['z1_batch'])
-                        else:
-                            logging.warning(f"Skipping file {data_file}: unknown dict format with keys {list(data.keys())}")
-                            continue
-                    else:
-                        # Handle files that are just tensors (like images_batch_*.pt)
-                        filename = os.path.basename(data_file)
-                        
-                        # Skip probability files and other non-data files
-                        if any(skip_pattern in filename for skip_pattern in ['probabilities', 'labels', 'metadata', 'weights']):
-                            logging.debug(f"Skipping non-data file: {data_file}")
-                            continue
-                        
-                        # Handle image files
-                        if 'images_batch' in filename or 'image_batch' in filename:
-                            # This is z1 (target images)
-                            z1_batch_list.append(data)
-                            # Create corresponding noise as z0
-                            noise = torch.randn_like(data)
-                            z0_batch_list.append(noise)
-                        elif 'noise_batch' in filename:
-                            # This is z0 (noise), need to find corresponding images
-                            # For now, skip single noise files
-                            logging.debug(f"Skipping noise-only file: {data_file}")
-                            continue
-                        else:
-                            # Check if it's a valid tensor with image-like dimensions
-                            if isinstance(data, torch.Tensor) and len(data.shape) == 4:
-                                # Assume it's image data and treat as z1
-                                logging.info(f"Treating tensor file {data_file} as image data (z1)")
-                                z1_batch_list.append(data)
-                                # Create corresponding noise as z0
-                                noise = torch.randn_like(data)
-                                z0_batch_list.append(noise)
-                            else:
-                                logging.debug(f"Skipping file {data_file}: not image-like tensor (shape: {data.shape if hasattr(data, 'shape') else 'unknown'})")
-                                continue
-                            
+                        logging.warning(f"Skipping file {data_file}: not dict with 'z0' or tensor")
+                        continue
                 except Exception as e:
                     logging.warning(f"Error loading {data_file}: {e}")
                     continue
             
-            if not z0_batch_list or not z1_batch_list:
-                logging.warning(f"No valid data found in batch {batch_start//batch_size + 1}")
+            if not z0_batch_list:
+                logging.warning(f"No valid z0 data found in batch {batch_start//batch_size + 1}")
                 continue
             
-            # Concatenate batch data
             z0_batch = torch.cat(z0_batch_list, dim=0)
-            z1_batch = torch.cat(z1_batch_list, dim=0)
             
             logging.info(f"Batch contains {len(z0_batch)} samples")
             total_samples += len(z0_batch)
@@ -679,8 +382,8 @@ class USpaceExtractor:
             logging.info(f"Processing batch for all time points: {time_points}")
             
             # Extract U-Space for all time points in one go
-            batch_uspace_results = self._extract_uspace_all_times(
-                z0_batch.numpy(), z1_batch.numpy(), time_points
+            batch_uspace_results = self.extract_uspace(
+                z0_batch.numpy(), time_points
             )
             
             # Save results for each time point
@@ -690,7 +393,7 @@ class USpaceExtractor:
                 uspace_results[t].append(final_file)
             
             # Clear memory
-            del z0_batch, z1_batch, z0_batch_list, z1_batch_list
+            del z0_batch, z0_batch_list
             torch.cuda.empty_cache()
             gc.collect()
         
@@ -707,12 +410,10 @@ class USpaceExtractor:
             'total_samples': total_samples,
             'num_batches_processed': (len(data_files) + batch_size - 1) // batch_size,
             'time_points': time_points,
-            'method': method,
             'file_paths': uspace_results,
             'metadata': {
                 'num_samples': total_samples,
                 'time_points': time_points,
-                'extraction_method': method,
                 'batch_processing': True,
                 'is_true_uspace': True,
                 'bottleneck_features': True
@@ -725,115 +426,26 @@ class USpaceExtractor:
             
         return summary_file
     
-    def _process_single_file(self, data_path: str, output_dir: str, time_points: List[float], method: str):
-        """Process single data file"""
-        logging.info(f"Processing single file: {data_path}")
-        
-        # Load data
-        if data_path.endswith('.pt'):
-            data_dict = torch.load(data_path, map_location='cpu')
-        else:
-            with open(data_path, 'rb') as f:
-                data_dict = pickle.load(f)
-        
-        if not isinstance(data_dict, dict) or 'z0' not in data_dict or 'z1' not in data_dict:
-            raise ValueError(f"Single file must contain dict with 'z0' and 'z1' keys")
-            
-        z0_data = data_dict['z0']
-        z1_data = data_dict['z1']
-        
-        logging.info(f"Loaded z0 shape: {z0_data.shape}")
-        logging.info(f"Loaded z1 shape: {z1_data.shape}")
-        
-        # Extract U-Space representations for all time points simultaneously
-        logging.info(f"Extracting U-Space for all time points: {time_points}")
-        uspace_data_list = self._extract_uspace_all_times(
-            z0_data.numpy() if hasattr(z0_data, 'numpy') else z0_data,
-            z1_data.numpy() if hasattr(z1_data, 'numpy') else z1_data,
-            time_points
-        )
-        
-        # Save results for each time point
-        uspace_results = {}
-        for i, t in enumerate(time_points):
-            output_file = os.path.join(output_dir, f'uspace_t_{t:.2f}.npy')
-            np.save(output_file, uspace_data_list[i])
-            uspace_results[t] = output_file
-            
-            # Save metadata
-            metadata_file = os.path.join(output_dir, f'uspace_t_{t:.2f}_metadata.pkl')
-            with open(metadata_file, 'wb') as f:
-                pickle.dump({
-                    'time': t,
-                    'method': method,
-                    'shape': uspace_data_list[i].shape,
-                    'extraction_time': t,
-                    'method_used': method,
-                    'data_file': output_file,
-                    'is_true_uspace': True,
-                    'bottleneck_features': True
-                }, f)
-                
-            logging.info(f"Saved TRUE U-Space data for t={t} to: {output_file}")
-            
-        # Clear data from memory
-        del uspace_data_list
-        gc.collect()
-        
-        # Create summary
-        summary_data = {
-            'z0_shape': z0_data.shape,
-            'z1_shape': z1_data.shape,
-            'time_points': time_points,
-            'method': method,
-            'file_paths': uspace_results,
-            'metadata': {
-                'num_samples': len(z0_data),
-                'time_points': time_points,
-                'extraction_method': method,
-                'incremental_save': True,
-                'is_true_uspace': True,
-                'bottleneck_features': True
-            }
-        }
-        
-        summary_file = os.path.join(output_dir, 'true_uspace_extraction_summary.pkl')
-        with open(summary_file, 'wb') as f:
-            pickle.dump(summary_data, f)
-            
-        return summary_file
-    
     def _combine_batch_files(self, batch_files: List[str], output_file: str):
-        """Combine multiple batch result files into one file using memory mapping"""
-        # First pass: get total size
-        total_samples = 0
-        sample_shape = None
+        """Combine multiple batch result files into one file"""
+        all_data = []
         
-        for batch_file in batch_files:
-            data = np.load(batch_file, mmap_mode='r')
-            if sample_shape is None:
-                sample_shape = data.shape[1:]
-            total_samples += data.shape[0]
-            del data
-        
-        # Create output file
-        final_shape = (total_samples,) + sample_shape
-        final_array = np.memmap(output_file, dtype=np.float32, mode='w+', shape=final_shape)
-        
-        # Second pass: copy data
-        current_idx = 0
         for batch_file in batch_files:
             data = np.load(batch_file)
-            end_idx = current_idx + data.shape[0]
-            final_array[current_idx:end_idx] = data
-            current_idx = end_idx
-            
-            # Clean up batch file
-            del data
+            all_data.append(data)
+        
+        if not all_data:
+            raise ValueError("No valid batch files to combine")
+        
+        combined_data = np.concatenate(all_data, axis=0)
+        np.save(output_file, combined_data)
+        
+        # Clean up batch files
+        for batch_file in batch_files:
             os.remove(batch_file)
         
-        del final_array
-        logging.info(f"Combined {len(batch_files)} batch files into {output_file}")
+        logging.info(f"Combined {len(batch_files)} files into {output_file}, shape: {combined_data.shape}")
+
 
 
 def main():
@@ -849,11 +461,8 @@ def main():
     parser.add_argument('--time_points', nargs='+', type=float, 
                        default=[0.1, 0.25, 0.5, 0.75],
                        help='Time points to extract (e.g., 0.1 0.25 0.5)')
-    parser.add_argument('--method', type=str, choices=['true_uspace'],
-                       default='true_uspace',
-                       help='Extraction method (only true_uspace supported - extracts UNet bottleneck features)')
     parser.add_argument('--checkpoint_path', type=str,
-                       help='Path to model checkpoint (required for true_uspace method)')
+                       help='Path to model checkpoint')
     parser.add_argument('--control_time', type=float, default=0.25,
                        help='Main control time point')
     parser.add_argument('--iteration', type=int,
@@ -871,23 +480,20 @@ def main():
     config = get_config()
     
     # Validate arguments
-    if args.method == 'true_uspace' and args.checkpoint_path is None:
-        raise ValueError("--checkpoint_path is required when using true_uspace method")
+    if args.checkpoint_path is None:
+        raise ValueError("--checkpoint_path is required")
         
     if not os.path.exists(args.data_path):
         raise FileNotFoundError(f"Data file not found: {args.data_path}")
         
-    # Create TRUE U-Space extractor
     extractor = USpaceExtractor(config, control_time=args.control_time)
     
-    # Process existing data using memory-efficient method
-    combined_file = extractor.process_existing_data_pairs_efficient(
+    combined_file = extractor.process(
         data_path=args.data_path,
         output_dir=args.output_dir,
-        time_points=args.time_points,
-        method=args.method,
-        checkpoint_path=args.checkpoint_path,
-        iteration=args.iteration
+        time_points=getattr(args, 'time_points', None),
+        checkpoint_path=getattr(args, 'checkpoint_path', None),
+        iteration=getattr(args, 'iteration', None)
     )
     
     logging.info(f"TRUE U-Space extraction completed!")

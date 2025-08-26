@@ -197,6 +197,7 @@ def run_single_iteration(config, workdir, iteration, base_model_path):
     
     # Step 1: Check for existing semantic data in current iteration, then generate if needed
     logging.info("Step 1: Looking for semantic data...")
+    print("Step 1: Looking for semantic data...")
 
     # Check if semantic data already exists in current iteration
     current_semantic_dir = os.path.join(iteration_dir, 'semantic_analysis')
@@ -222,6 +223,7 @@ def run_single_iteration(config, workdir, iteration, base_model_path):
                 semantic_data_path = pt_files_dir
                 semantic_data_found = True
                 logging.info(f"Found existing semantic data in pt_files: {semantic_data_path}")
+                print(f"Found existing semantic data in pt_files: {semantic_data_path}")
                 logging.info(f"Found {len(pt_files)} data files in pt_files: {pt_files[:5]}...")  # Show first 5 files
                 
         # If we found files in root but not in pt_files, use root
@@ -229,6 +231,7 @@ def run_single_iteration(config, workdir, iteration, base_model_path):
             semantic_data_path = current_semantic_dir
             semantic_data_found = True
             logging.info(f"Found existing semantic data in root: {semantic_data_path}")
+            print(f"Found existing semantic data in root: {semantic_data_path}")
             logging.info(f"Found {len(root_files)} data files: {root_files}")
             
         # Also check for generated_data directory with generated_pairs.pt
@@ -246,6 +249,7 @@ def run_single_iteration(config, workdir, iteration, base_model_path):
     if not semantic_data_found:
         # Generate new semantic data pairs
         logging.info("Generating new semantic data pairs...")
+        print("Generating new semantic data pairs...")
         try:
             from run_lib_semantic_reflow import generate_semantic_data_pairs
             
@@ -277,33 +281,87 @@ def run_single_iteration(config, workdir, iteration, base_model_path):
             raise
 
 
-    # Step 2: Extract U-Space representations at t=0.2 (using U-Space from UNet bottleneck)
-
-    logging.info("Step 2: Extracting U-Space representations from UNet bottleneck...")
-    control_time = getattr(config, 'semantic', {}).get('control_time', 0.2)
-    uspace_extractor = USpaceExtractor(config, control_time=control_time)
-    
-    # Process data pairs to extract U-Space using UNet bottleneck features (memory-efficient)
-    workdir_parent = os.path.dirname(iteration_dir)
-    combined_file = uspace_extractor.process_existing_data_pairs_efficient(
-        data_path=semantic_data_path,
-        output_dir=workdir_parent,
-        time_points=[control_time],
-        method='true_uspace',
-        checkpoint_path=base_model_path,
-        iteration=iteration
-    )
-    
+    # Step 2: Extract U-Space representations at t=0.2 
+    logging.info("Step 2: Checking for existing U-Space representations...")
+    print("Step 2: Checking for existing U-Space representations...")
     uspace_dir = os.path.join(iteration_dir, 'uspace_extracted')
-    logging.info(f"U-Space extraction completed, results in: {uspace_dir}")
+    control_time = getattr(config, 'semantic', {}).get('control_time', 0.2)
+    uspace_file = os.path.join(uspace_dir, f'uspace_t_{control_time:.2f}.npy')
+    
+    uspace_exists = False
+    
+    # Check if U-Space data already exists
+    if os.path.exists(uspace_dir):
+        # Check for the specific time point file
+        if os.path.exists(uspace_file):
+            try:
+                # Try to load and verify the file
+                test_data = np.load(uspace_file, allow_pickle=True)
+                if len(test_data) > 0:
+                    uspace_exists = True
+                    logging.info(f"Found existing U-Space data: {uspace_file}")
+                    logging.info(f"U-Space data shape: {test_data.shape}")
+                else:
+                    logging.warning(f"U-Space file exists but is empty: {uspace_file}")
+            except Exception as e:
+                logging.warning(f"U-Space file exists but cannot be loaded: {e}")
+        
+        # If specific file doesn't exist, check for any uspace files
+        if not uspace_exists:
+            import glob
+            existing_uspace_files = glob.glob(os.path.join(uspace_dir, 'uspace_t_*.npy'))
+            if existing_uspace_files:
+                logging.info(f"Found existing U-Space files: {existing_uspace_files}")
+                # Use the first available file
+                uspace_file = existing_uspace_files[0]
+                try:
+                    test_data = np.load(uspace_file, allow_pickle=True)
+                    if len(test_data) > 0:
+                        uspace_exists = True
+                        logging.info(f"Using existing U-Space data: {uspace_file}")
+                        logging.info(f"U-Space data shape: {test_data.shape}")
+                except Exception as e:
+                    logging.warning(f"Cannot load existing U-Space file {uspace_file}: {e}")
+    
+    if not uspace_exists:
+        # Extract new U-Space representations
+        logging.info("Extracting new U-Space representations from UNet bottleneck...")
+        uspace_extractor = USpaceExtractor(config, control_time=control_time)
+        
+        # Process data pairs to extract U-Space using UNet bottleneck features (memory-efficient)
+        workdir_parent = os.path.dirname(iteration_dir)
+        combined_file = uspace_extractor.process(
+            data_path=semantic_data_path,
+            output_dir=workdir_parent,
+            time_points=[control_time],
+            checkpoint_path=base_model_path,
+            iteration=iteration
+        )
+        
+        logging.info(f"U-Space extraction completed, results in: {uspace_dir}")
+        
+        # Verify the extraction was successful
+        if os.path.exists(uspace_file):
+            try:
+                test_data = np.load(uspace_file, allow_pickle=True)
+                logging.info(f"Verified new U-Space data shape: {test_data.shape}")
+            except Exception as e:
+                logging.error(f"Failed to verify extracted U-Space data: {e}")
+                raise
+        else:
+            logging.error(f"U-Space extraction failed - file not found: {uspace_file}")
+            raise FileNotFoundError(f"U-Space extraction failed")
+    else:
+        logging.info("Using existing U-Space data, skipping extraction")
+    
     
     # Step 3: Train semantic boundary in U-Space using SVM
     logging.info("Step 3: Training semantic boundary in U-Space...")
+    print("Step 3: Training semantic boundary in U-Space...")
     boundary_trainer = SemanticBoundaryTrainer(
         interfacegan_model_path=getattr(config.semantic, 'interfacegan_model_path', ''),
         device=str(config.device)
     )
-    
     boundary_info = boundary_trainer.train_uspace_boundary(
         uspace_dir=uspace_dir,
         iteration=iteration,
@@ -315,6 +373,7 @@ def run_single_iteration(config, workdir, iteration, base_model_path):
     
     # Step 4: Train reflow model with U-Space control (u' = u + k * v_t)
     logging.info("Step 4: Training U-Space aware semantic reflow...")
+    print("Step 4: Training U-Space aware semantic reflow...")
     from run_lib_semantic_reflow import train_semantic_reflow
     
     model_path = train_semantic_reflow(

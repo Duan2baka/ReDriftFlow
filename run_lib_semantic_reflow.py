@@ -36,13 +36,13 @@ except ImportError as e:
 
 # Import ImageGeneration modules with try-except for development
 try:
-    import run_lib_reflow
-    import sampling
-    import sde_lib
-    from models import utils as mutils
-    from models.ema import ExponentialMovingAverage
-    import datasets
-    from utils import save_checkpoint
+    from ImageGeneration import run_lib_reflow
+    from ImageGeneration import sampling
+    from ImageGeneration import sde_lib
+    from ImageGeneration.models import utils as mutils
+    from ImageGeneration.models.ema import ExponentialMovingAverage
+    from ImageGeneration import datasets
+    from ImageGeneration.utils import save_checkpoint
 except ImportError as e:
     logging.warning(f"Some ImageGeneration modules not found: {e}")
     # For development/testing, define minimal stubs
