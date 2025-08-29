@@ -416,10 +416,6 @@ class USpaceExtractor:
                 continue
             
             z0_batch = torch.cat(z0_batch_list, dim=0)
-            if batch_num == 1:
-                tqdm.write(f"Batch {batch_num} contains {len(z0_batch)} samples")
-                tqdm.write(f"Processing batch {batch_num} for time points: {time_points}")
-                tqdm.write(f"Batch {batch_num} - Extracted U-Space shapes: {[r.shape for r in batch_uspace_results]}")
             total_samples += len(z0_batch)
             
             # Process this batch for all time points together
@@ -434,6 +430,10 @@ class USpaceExtractor:
             batch_uspace_results = self.extract_uspace(
                 z0_batch.numpy(), time_points
             )
+            if batch_num == 1:
+                tqdm.write(f"Batch {batch_num} contains {len(z0_batch)} samples")
+                tqdm.write(f"Processing batch {batch_num} for time points: {time_points}")
+                tqdm.write(f"Batch {batch_num} - Extracted U-Space shapes: {[r.shape for r in batch_uspace_results]}")
 
 
             # Save results for each time point
