@@ -148,7 +148,7 @@ class SemanticBoundaryTrainer:
             Binary classifications (0 or 1) or tuple of (labels, probabilities)
         """
         with torch.no_grad():
-            # Debug: Print input statistics (only if debug=True)
+            # Debug: Print input statistics
             if debug:
                 print(f"Input images - Shape: {images.shape}, Min: {images.min().item():.3f}, Max: {images.max().item():.3f}")
             
@@ -165,15 +165,15 @@ class SemanticBoundaryTrainer:
                 # Clamp to ensure values are in [0, 1] range
                 images = torch.clamp(images, 0.0, 1.0)
                 
-                # Resize to 224x224 (standard for most pretrained models)
-                if images.shape[-1] != 224 or images.shape[-2] != 224:
+                # Resize to 256 (NOT 224) - match your working classifier
+                if images.shape[-1] != 256 or images.shape[-2] != 256:
                     images = torch.nn.functional.interpolate(
-                        images, size=(224, 224), mode='bilinear', align_corners=False
+                        images, size=(256, 256), mode='bilinear', align_corners=False
                     )
                     if debug:
-                        print(f"Resized to 224x224 - Shape: {images.shape}")
+                        print(f"Resized to 256x256 - Shape: {images.shape}")
                 
-                # Apply ImageNet normalization (same as predictor_inference.py)
+                # Apply ImageNet normalization (same as your working classifier)
                 mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(images.device)
                 std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(images.device)
                 images = (images - mean) / std
@@ -185,8 +185,9 @@ class SemanticBoundaryTrainer:
                 if debug:
                     print(f"Model outputs - Shape: {outputs.shape}, Sample values: {outputs[:5] if len(outputs) > 0 else outputs}")
                 
-                # For 2-class output, get both probabilities and predictions
+                # Process outputs based on model architecture
                 if len(outputs.shape) > 1 and outputs.shape[1] == 2:
+                    # 2-class output
                     probabilities = torch.softmax(outputs, dim=1)[:, 1]  # Get positive class probability
                     _, predicted = torch.max(outputs.data, 1)
                     labels = predicted.cpu().numpy()
@@ -216,7 +217,7 @@ class SemanticBoundaryTrainer:
                         return labels, probs
                     return labels
             else:
-                # Already in latent space format
+                # Handle latent space format (if applicable)
                 outputs = self.predictor(images)
                 if len(outputs.shape) > 1 and outputs.shape[1] == 2:
                     probabilities = torch.softmax(outputs, dim=1)[:, 1]
@@ -233,6 +234,7 @@ class SemanticBoundaryTrainer:
                 if return_probabilities:
                     return labels, probs
                 return labels
+
     
     def collect_training_data(self, 
                             noise_vectors: np.ndarray, 

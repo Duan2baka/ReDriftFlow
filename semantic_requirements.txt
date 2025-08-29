@@ -6,3 +6,6 @@ wandb
 matplotlib
 pillow
 thundersvm
+
+
+python uspace_train.py --config configs/celeba_256_semantic_reflow_iterative.py --workdir workdir/debug_run --iterations 1

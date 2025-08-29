@@ -103,12 +103,9 @@ def create_image_grid(images, nrow=8, save_path=None):
     else:
         img_tensor = torch.from_numpy(images)
     
-    # Check the range of the input data
     min_val = img_tensor.min().item()
     max_val = img_tensor.max().item()
     
-    # The images from sampling_fn should already be in [0,1] range after inverse_scaler
-    # Only normalize if they are in [-1,1] range
     if min_val < -0.5:  # Likely in [-1,1] range
         img_tensor = (img_tensor + 1.0) / 2.0
     
@@ -221,136 +218,6 @@ def log_classification_results(labels, boundary_accuracy=None):
     wandb.log({"classification/distribution_chart": wandb.Image(fig)})
     plt.close(fig)
 
-def generate_semantic_variations(sde, score_model, inverse_scaler, config, 
-                                z0_sample, boundary_vector, sampling_fn):
-    """Generate semantic variations using boundary vector in u-space at t=0.5"""
-    variations = {}
-    
-    # Define variation strengths
-    strengths = [-2.0, -1.0, 0.0, 1.0, 2.0]
-    
-    # Convert to tensor
-    if isinstance(z0_sample, np.ndarray):
-        z0_tensor = torch.from_numpy(z0_sample).to(config.device).unsqueeze(0)
-    else:
-        z0_tensor = z0_sample.to(config.device).unsqueeze(0)
-    
-    # Reshape boundary vector to match u-space dimensions if needed
-    if isinstance(boundary_vector, np.ndarray):
-        boundary_tensor = torch.from_numpy(boundary_vector).to(config.device)
-    else:
-        boundary_tensor = boundary_vector
-    
-    # Reshape boundary to image dimensions if it's flattened
-    if len(boundary_tensor.shape) == 1:
-        boundary_tensor = boundary_tensor.reshape(config.data.num_channels, 
-                                                config.data.image_size, 
-                                                config.data.image_size).unsqueeze(0)
-    elif len(boundary_tensor.shape) == 3:
-        boundary_tensor = boundary_tensor.unsqueeze(0)
-    
-    for strength in strengths:
-        # Sample with u-space control at t=0.5
-        with torch.no_grad():
-            z1_modified = sample_with_uspace_control(
-                sde, score_model, inverse_scaler, z0_tensor, 
-                boundary_tensor, strength, config
-            )
-        
-        variations[f"strength_{strength}"] = z1_modified.cpu().numpy()[0]
-    
-    return variations
-
-def sample_with_uspace_control(sde, score_model, inverse_scaler, z0, boundary_vector, strength, config):
-    """Sample with u-space control at t=0.5"""
-    # Set up sampling
-    shape = z0.shape
-    timesteps = torch.linspace(sde.T, sde.eps, config.sampling.sample_N, device=config.device)
-    dt = -1.0 / config.sampling.sample_N
-    
-    # Start sampling
-    x = z0.clone()
-    control_step = len(timesteps) - len(timesteps) // 4  # Apply control at t=0.25 (closer to 0)
-    
-    for i, t in enumerate(timesteps[:-1]):
-        t_tensor = torch.ones(shape[0], device=config.device) * t
-        score = score_model(x, t_tensor)
-        
-        # Apply u-space control at t=0.25 (closer to 0)
-        if i == control_step:
-            x = x + strength * boundary_vector
-        
-        # Euler step
-        x = x + dt * score
-    
-    # Final step
-    t_final = torch.ones(shape[0], device=config.device) * sde.eps
-    score_final = score_model(x, t_final)
-    x = x + dt * score_final
-    
-    return inverse_scaler(x)
-
-def log_semantic_variations(sde, score_model, inverse_scaler, config, sampling_fn,
-                           z0_data, boundary_vector, num_examples=5):
-    """Log semantic boundary variations to WandB and save as images"""
-    if boundary_vector is None or len(z0_data) == 0:
-        return
-    
-    # Create variations directory
-    variations_dir = os.path.join(config.semantic_variations_dir, 'semantic_variations')
-    os.makedirs(variations_dir, exist_ok=True)
-    
-    variation_grids = []
-    
-    for example_idx in range(min(num_examples, len(z0_data))):
-        z0_sample = z0_data[example_idx]
-        if torch.is_tensor(z0_sample):
-            z0_sample = z0_sample.cpu().numpy()
-        
-        # Generate variations using u-space control
-        variations = generate_semantic_variations(
-            sde, score_model, inverse_scaler, config,
-            z0_sample, boundary_vector, None  # No longer need sampling_fn
-        )
-        
-        # Save individual variation images
-        example_dir = os.path.join(variations_dir, f'example_{example_idx+1}')
-        os.makedirs(example_dir, exist_ok=True)
-        
-        # Create 1x5 grid and save individual images
-        grid_images = []
-        for strength in [-2.0, -1.0, 0.0, 1.0, 2.0]:
-            img = variations[f"strength_{strength}"]
-            
-            # Normalize to [0,1]
-            if img.min() < 0:
-                img = (img + 1.0) / 2.0
-            img = np.clip(img, 0, 1)
-            
-            # Convert from CHW to HWC
-            if img.shape[0] == 3:
-                img_hwc = img.transpose(1, 2, 0)
-            else:
-                img_hwc = img
-            
-            # Save individual image
-            img_path = os.path.join(example_dir, f'strength_{strength:.1f}.png')
-            img_pil = Image.fromarray((img_hwc * 255).astype(np.uint8))
-            img_pil.save(img_path)
-            
-            grid_images.append(img_hwc)
-        
-        # Create and save horizontal grid
-        grid = np.concatenate(grid_images, axis=1)
-        grid_path = os.path.join(example_dir, f'variation_grid.png')
-        grid_pil = Image.fromarray((grid * 255).astype(np.uint8))
-        grid_pil.save(grid_path)
-        
-        variation_grids.append(wandb.Image(grid, caption=f"Semantic Variations {example_idx+1}: -2σ to +2σ"))
-    
-    wandb.log({"semantic_variations": variation_grids})
-    logging.info(f"Saved semantic variations to {variations_dir}")
-
 def log_boundary_training_results(boundary_details):
     """Log semantic boundary training results"""
     if boundary_details is None:
@@ -432,21 +299,17 @@ def generate_data_from_z0(config, workdir, num_samples):
         sample_N=getattr(config.sampling, 'sample_N', 50)
     )
     
-    # Load model using the improved function
     checkpoint_path = config.reflow.last_flow_ckpt
     score_model, inverse_scaler = load_model_and_config(config, checkpoint_path)
     
-    # Use adaptive batch size for generation based on available memory
     max_batch_size = min(config.semantic.semantic_batch_size, 4)  # Max 8 samples at a time
     generation_batch_size = max_batch_size
     
-    # Configure sampling with adaptive batch size
     sampling_shape = (generation_batch_size, config.data.num_channels, 
                      config.data.image_size, config.data.image_size)
     sampling_eps = 1e-3
     sampling_fn = sampling.get_sampling_fn(config, sde, sampling_shape, inverse_scaler, sampling_eps)
     
-    # Generate data in very small batches
     num_batches = (num_samples + generation_batch_size - 1) // generation_batch_size
     
     # Store batch file paths instead of keeping data in memory
@@ -472,58 +335,25 @@ def generate_data_from_z0(config, workdir, num_samples):
         
         # Generate samples
         with torch.no_grad():
-            try:
-                z1, _ = sampling_fn(score_model)
-            except RuntimeError as e:
-                if "out of memory" in str(e):
-                    logging.warning(f"OOM at batch {batch_idx+1}, clearing cache and retrying...")
-                    torch.cuda.empty_cache()
-                    # Try with even smaller batch size
-                    if current_batch_size > 1:
-                        current_batch_size = 1
-                        sampling_shape = (1, config.data.num_channels, 
-                                         config.data.image_size, config.data.image_size)
-                        sampling_fn = sampling.get_sampling_fn(config, sde, sampling_shape, inverse_scaler, sampling_eps)
-                        z0 = sde.get_z0(torch.zeros(sampling_shape, device=config.device), 
-                                       train=False).to(config.device)
-                        z1, _ = sampling_fn(score_model)
-                    else:
-                        raise e
+            z1, _ = sampling_fn(score_model)
         
         # Save each batch immediately to avoid memory accumulation
         batch_file_path = os.path.join(pt_files_dir, f'batch_{batch_idx+1}_pairs.pt')
         
-        # Robust save with error handling and memory optimization
-        try:
-            # Move to CPU and ensure contiguous memory layout
-            z0_cpu = z0.cpu().contiguous()
-            z1_cpu = z1.cpu().contiguous()
-            
-            torch.save({
-                'z0_batch': z0_cpu,
-                'z1_batch': z1_cpu,
-                'batch_idx': batch_idx,
-                'total_batches': num_batches,
-                'batch_size': z0.shape[0]
-            }, batch_file_path, pickle_protocol=4, _use_new_zipfile_serialization=False)
-            
-            # Clean up CPU tensors
-            del z0_cpu, z1_cpu
-            
-        except Exception as save_error:
-            logging.warning(f"Failed to save batch {batch_idx+1} with torch.save: {save_error}")
-            logging.info(f"Falling back to numpy save for batch {batch_idx+1}")
-            
-            # Fallback: save as numpy arrays
-            import numpy as np
-            batch_file_path_npz = batch_file_path.replace('.pt', '.npz')
-            np.savez_compressed(batch_file_path_npz,
-                               z0_batch=z0.cpu().numpy(),
-                               z1_batch=z1.cpu().numpy(),
-                               batch_idx=batch_idx,
-                               total_batches=num_batches,
-                               batch_size=z0.shape[0])
-            batch_file_path = batch_file_path_npz
+        # Move to CPU and ensure contiguous memory layout
+        z0_cpu = z0.cpu().contiguous()
+        z1_cpu = z1.cpu().contiguous()
+        
+        torch.save({
+            'z0_batch': z0_cpu,
+            'z1_batch': z1_cpu,
+            'batch_idx': batch_idx,
+            'total_batches': num_batches,
+            'batch_size': z0.shape[0]
+        }, batch_file_path, pickle_protocol=4, _use_new_zipfile_serialization=False)
+
+        # Clean up CPU tensors
+        del z0_cpu, z1_cpu
         
         # Save images as individual files
         batch_start_idx = batch_idx * generation_batch_size
@@ -592,33 +422,18 @@ def generate_data_from_z0(config, workdir, num_samples):
     
     # Save final consolidated data with robust error handling
     data_path = os.path.join(generate_dir, 'generated_pairs.pt')
-    try:
-        # Ensure tensors are contiguous and on CPU
-        z0_save = z0_data.cpu().contiguous()
-        z1_save = z1_data.cpu().contiguous()
-        
-        torch.save({'z0': z0_save, 'z1': z1_save}, data_path, pickle_protocol=4, _use_new_zipfile_serialization=False)
-        logging.info(f"Saved final data to {data_path}")
-        
-    except Exception as save_error:
-        logging.warning(f"Failed to save final data with torch.save: {save_error}")
-        logging.info("Falling back to numpy save for final data")
-        
-        # Fallback: save as numpy arrays
-        import numpy as np
-        data_path_npz = data_path.replace('.pt', '.npz')
-        np.savez_compressed(data_path_npz,
-                           z0=z0_data.cpu().numpy(),
-                           z1=z1_data.cpu().numpy())
-        data_path = data_path_npz
-        logging.info(f"Saved final data to {data_path}")
+    z0_save = z0_data.cpu().contiguous()
+    z1_save = z1_data.cpu().contiguous()
     
-    finally:
-        # Clean up data copies
-        if 'z0_save' in locals():
-            del z0_save
-        if 'z1_save' in locals():
-            del z1_save
+    torch.save({'z0': z0_save, 'z1': z1_save}, data_path, pickle_protocol=4, _use_new_zipfile_serialization=False)
+    logging.info(f"Saved final data to {data_path}")
+        
+    
+    # Clean up data copies
+    if 'z0_save' in locals():
+        del z0_save
+    if 'z1_save' in locals():
+        del z1_save
     
     # Save final image grid
     final_grid_path = os.path.join(generate_dir, 'all_generated_grid.png')
@@ -642,8 +457,8 @@ def generate_data_from_z0(config, workdir, num_samples):
         pickle.dump(batch_index, f)
     
     logging.info(f"Saved batch file index to {batch_index_path}")
-    
     logging.info(f"Generated {len(z0_data)} data pairs, saved to: {data_path}")
+    print(f"Generated {len(z0_data)} data pairs, saved to: {data_path}")
     
     # Clean up memory before returning
     del z0_data, z1_data
@@ -651,30 +466,25 @@ def generate_data_from_z0(config, workdir, num_samples):
     gc.collect()
     
     return data_path
+
 def generate_semantic_data_pairs(config, 
                                 workdir: str,
                                 interfacegan_model_path: str,
                                 num_samples: int = 10000) -> str:
     """
-    Generate (noise, data) pairs with semantic classification
-    Returns path to the generated data file
+    Generate semantic classified (noise, data) pairs
+    Returns path to generated data files
     """
     logging.info(f"Generating {num_samples} semantic data pairs...")
     
     # Create semantic analysis directories
     semantic_dir = os.path.join(workdir, 'semantic_analysis')
     classification_dir = os.path.join(semantic_dir, 'classifications')
-    boundary_dir = os.path.join(semantic_dir, 'boundaries')
-    intermediate_semantic_dir = os.path.join(semantic_dir, 'intermediate')
     pt_semantic_dir = os.path.join(semantic_dir, 'pt_files')
     classified_images_dir = os.path.join(semantic_dir, 'classified_images')
     
-    os.makedirs(semantic_dir, exist_ok=True)
-    os.makedirs(classification_dir, exist_ok=True)
-    os.makedirs(boundary_dir, exist_ok=True)
-    os.makedirs(intermediate_semantic_dir, exist_ok=True)
-    os.makedirs(pt_semantic_dir, exist_ok=True)
-    os.makedirs(classified_images_dir, exist_ok=True)
+    for dir_path in [semantic_dir, classification_dir, pt_semantic_dir, classified_images_dir]:
+        os.makedirs(dir_path, exist_ok=True)
     
     # Initialize semantic boundary trainer
     semantic_trainer = SemanticBoundaryTrainer(
@@ -682,126 +492,75 @@ def generate_semantic_data_pairs(config,
         device=config.device
     )
     
-    # Generate data pairs using reflow model
-    data_path = generate_data_from_z0(config, workdir, num_samples)
+    # Generate data pairs
+    _ = generate_data_from_z0(config, workdir, num_samples)
     
-    # Load generated data
-    data_dict = torch.load(data_path, map_location='cpu')
+    # Load batch file index
+    pt_files_dir = os.path.join(workdir, 'intermediate_results', 'pt_files')
+    batch_index_path = os.path.join(pt_files_dir, 'batch_file_index.pkl')
     
-    z0_data = data_dict['z0']  # noise vectors
-    z1_data = data_dict['z1']  # generated images
+    with open(batch_index_path, 'rb') as f:
+        batch_index = pickle.load(f)
     
-    # Convert to appropriate format for classification
-    if isinstance(z1_data, np.ndarray):
-        z1_tensor = torch.from_numpy(z1_data).to(config.device)
-    else:
-        z1_tensor = z1_data.to(config.device)
+    batch_files = batch_index['batch_files']
     
-    if isinstance(z0_data, np.ndarray):
-        z0_tensor = torch.from_numpy(z0_data)
-    else:
-        z0_tensor = z0_data
-    
-    # Ensure correct shape for 256x256 images (batch, channels, height, width)
-    if len(z1_tensor.shape) == 4 and z1_tensor.shape[1] == 3:
-        # Already in correct format (NCHW)
-        pass
-    elif len(z1_tensor.shape) == 4 and z1_tensor.shape[-1] == 3:
-        # Convert from (batch, height, width, channels) to (batch, channels, height, width)
-        z1_tensor = z1_tensor.permute(0, 3, 1, 2)
-    
-    # Ensure images are in [0, 1] range for classification
-    if z1_tensor.max() > 1.0:
-        z1_tensor = z1_tensor / 255.0
-    elif z1_tensor.min() < 0:
-        # Convert from [-1, 1] to [0, 1]
-        z1_tensor = (z1_tensor + 1.0) / 2.0
-    
-    # Collect semantic labels with memory-efficient processing
+    # Process semantic classification
     all_noise_files = []
     all_images_files = []
     all_labels = []
     positive_count = 0
     negative_count = 0
     
-    batch_size = config.semantic.semantic_batch_size
-    
-    for i in tqdm(range(0, len(z0_tensor), batch_size), desc="Classifying images"):
-        end_idx = min(i + batch_size, len(z0_tensor))
+    for batch_idx, batch_file_path in enumerate(tqdm(batch_files, desc="Classifying images")):
+        # Load single batch
+        batch_data = torch.load(batch_file_path, map_location='cpu')
+        z0_batch = batch_data['z0_batch']
+        z1_batch = batch_data['z1_batch']
         
-        noise_batch = z0_tensor[i:end_idx]
-        image_batch = z1_tensor[i:end_idx]
+        z1_tensor = z1_batch.to(config.device)
         
-        # Get semantic classifications with probabilities (enable debug for first batch only)
-        labels, probabilities = semantic_trainer.classify_images(image_batch, debug=(i == 0), return_probabilities=True)
+        if z1_tensor.shape[-1] == 3:
+            z1_tensor = z1_tensor.permute(0, 3, 1, 2)
         
-        # Save batch data to disk immediately to avoid memory buildup
-        batch_num = i // batch_size + 1
+        if z1_tensor.min() < -0.5:
+            z1_tensor = (z1_tensor + 1.0) / 2.0
+        
+        z1_tensor = torch.clamp(z1_tensor, 0, 1)
+        
+        labels, probabilities = semantic_trainer.classify_images(
+            z1_tensor, 
+            debug=(batch_idx == 0), 
+            return_probabilities=True
+        )
+        
+        batch_num = batch_idx + 1
         batch_noise_path = os.path.join(pt_semantic_dir, f'noise_batch_{batch_num}.pt')
         batch_images_path = os.path.join(pt_semantic_dir, f'images_batch_{batch_num}.pt')
         batch_probs_path = os.path.join(pt_semantic_dir, f'probabilities_batch_{batch_num}.pt')
         
-        # Robust save with error handling and memory optimization
-        try:
-            # Move to CPU and ensure contiguous memory layout
-            noise_batch_cpu = noise_batch.cpu().contiguous()
-            image_batch_cpu = image_batch.cpu().contiguous()
-            
-            # Save with pickle protocol 4 and compression disabled
-            torch.save(noise_batch_cpu, batch_noise_path, pickle_protocol=4, _use_new_zipfile_serialization=False)
-            torch.save(image_batch_cpu, batch_images_path, pickle_protocol=4, _use_new_zipfile_serialization=False)
-            torch.save(torch.tensor(probabilities), batch_probs_path, pickle_protocol=4, _use_new_zipfile_serialization=False)
-            
-            # Clean up CPU tensors immediately
-            del noise_batch_cpu, image_batch_cpu
-            
-        except Exception as save_error:
-            logging.warning(f"Failed to save batch {batch_num} with torch.save: {save_error}")
-            logging.info(f"Falling back to individual tensor saves for batch {batch_num}")
-            
-            # Fallback: save individual samples in the batch
-            batch_noise_dir = os.path.join(pt_semantic_dir, f'noise_batch_{batch_num}')
-            batch_images_dir = os.path.join(pt_semantic_dir, f'images_batch_{batch_num}')
-            batch_probs_dir = os.path.join(pt_semantic_dir, f'probabilities_batch_{batch_num}')
-            os.makedirs(batch_noise_dir, exist_ok=True)
-            os.makedirs(batch_images_dir, exist_ok=True)
-            os.makedirs(batch_probs_dir, exist_ok=True)
-            
-            for idx in range(len(noise_batch)):
-                individual_noise_path = os.path.join(batch_noise_dir, f'sample_{idx}.pt')
-                individual_image_path = os.path.join(batch_images_dir, f'sample_{idx}.pt')
-                individual_prob_path = os.path.join(batch_probs_dir, f'sample_{idx}.pt')
-                torch.save(noise_batch[idx:idx+1].cpu().contiguous(), individual_noise_path, pickle_protocol=4)
-                torch.save(image_batch[idx:idx+1].cpu().contiguous(), individual_image_path, pickle_protocol=4)
-                torch.save(torch.tensor([probabilities[idx]]), individual_prob_path, pickle_protocol=4)
-        
-        # Count classified images but don't save individual files to save space
-        for j, label in enumerate(labels):
-            if label == 1:  # Positive (smile)
+        torch.save(z0_batch.contiguous(), batch_noise_path, pickle_protocol=4, _use_new_zipfile_serialization=False)
+        torch.save(z1_batch.contiguous(), batch_images_path, pickle_protocol=4, _use_new_zipfile_serialization=False)
+        torch.save(torch.tensor(probabilities), batch_probs_path, pickle_protocol=4, _use_new_zipfile_serialization=False)
+        #print(f"Batch {batch_num} - Noise shape: {z0_batch.shape}, Image shape: {z1_batch.shape}")
+        #print(f"Loaded noise dtype: {z0_batch.dtype}")
+        #print(f"Expected size: {z0_batch.numel() * z0_batch.element_size() / 1024 / 1024:.1f}MB")
+        # Count classification results
+        for label in labels:
+            if label == 1:
                 positive_count += 1
-            else:  # Negative (no smile)
+            else:
                 negative_count += 1
         
-        # Save a few sample images for debugging (only first batch)
-        if i == 0:
+        # Save debug samples (first batch only)
+        if batch_idx == 0:
             sample_dir = os.path.join(classified_images_dir, 'debug_samples')
             os.makedirs(sample_dir, exist_ok=True)
             
-            # Save first 4 images from the batch for debugging
-            for j in range(min(4, len(image_batch))):
-                img = image_batch[j].cpu()
+            for j in range(min(4, len(z1_tensor))):
+                img = z1_tensor[j].cpu()
                 label = labels[j]
                 
-                # Normalize and save individual image using PIL
-                min_val = img.min().item()
-                if min_val < -0.5:  # Likely in [-1,1] range
-                    img_normalized = (img + 1.0) / 2.0
-                else:  # Already in [0,1] range
-                    img_normalized = img
-                
-                img_normalized = torch.clamp(img_normalized, 0, 1)
-                
-                # Convert to PIL format and save
+                img_normalized = torch.clamp(img, 0, 1)
                 img_np = img_normalized.permute(1, 2, 0).numpy()
                 img_np = np.clip(img_np * 255.0, 0, 255).astype(np.uint8)
                 img_pil = Image.fromarray(img_np)
@@ -809,69 +568,34 @@ def generate_semantic_data_pairs(config,
                 label_name = "smile" if label == 1 else "no_smile"
                 img_path = os.path.join(sample_dir, f'debug_{j}_{label_name}.png')
                 img_pil.save(img_path)
-            
-            logging.info(f"Saved debug sample images to {sample_dir}")
         
         all_noise_files.append(batch_noise_path)
         all_images_files.append(batch_images_path)
         all_labels.extend(labels)
         
-        # Clear GPU memory immediately after processing each batch
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        # Create classification grids every 50 batches
+        if batch_num % 50 == 0:
+            positive_indices = [i for i, label in enumerate(labels) if label == 1]
+            negative_indices = [i for i, label in enumerate(labels) if label == 0]
+            
+            if positive_indices:
+                pos_samples = z1_tensor[positive_indices[:16]]
+                pos_grid_path = os.path.join(classified_images_dir, f'positive_grid_batch_{batch_num}.png')
+                create_image_grid(pos_samples.cpu(), nrow=4, save_path=pos_grid_path)
+            
+            if negative_indices:
+                neg_samples = z1_tensor[negative_indices[:16]]
+                neg_grid_path = os.path.join(classified_images_dir, f'negative_grid_batch_{batch_num}.png')
+                create_image_grid(neg_samples.cpu(), nrow=4, save_path=neg_grid_path)
         
-        # Force garbage collection every few batches
-        if (i // batch_size + 1) % 10 == 0:
-            gc.collect()
-        
-        # Save intermediate classification results every 50 batches to reduce log noise
-        if batch_num % 50 == 0 or end_idx >= len(z0_tensor):
-            classification_batch_path = os.path.join(classification_dir, f'classification_batch_{batch_num}.pkl')
-            
-            classification_data = {
-                'labels_batch': labels,
-                'batch_start_idx': i,
-                'batch_end_idx': end_idx,
-                'batch_num': batch_num,
-                'noise_file': batch_noise_path,
-                'images_file': batch_images_path,
-                'total_samples': len(z0_tensor)
-            }
-            
-            with open(classification_batch_path, 'wb') as f:
-                pickle.dump(classification_data, f)
-            
-            # Only log at milestones to keep tqdm clean
-            if batch_num % 100 == 0 or end_idx >= len(z0_tensor):
-                logging.info(f"Classification progress: batch {batch_num} completed")
-            
-            # Create classification grids every 50 batches
-            if batch_num % 50 == 0:
-                # Get recent positive and negative samples for grids
-                recent_positives = []
-                recent_negatives = []
-                
-                for k in range(max(0, i-20*batch_size), end_idx):
-                    if k < len(all_labels) and all_labels[k] == 1:
-                        recent_positives.append(z1_tensor[k:k+1])
-                    elif k < len(all_labels) and all_labels[k] == 0:
-                        recent_negatives.append(z1_tensor[k:k+1])
-                
-                if recent_positives:
-                    pos_grid_path = os.path.join(classified_images_dir, f'positive_grid_batch_{batch_num}.png')
-                    pos_samples = torch.cat(recent_positives[:16])  # Max 16 samples
-                    create_image_grid(pos_samples.cpu(), nrow=4, save_path=pos_grid_path)
-                
-                if recent_negatives:
-                    neg_grid_path = os.path.join(classified_images_dir, f'negative_grid_batch_{batch_num}.png')
-                    neg_samples = torch.cat(recent_negatives[:16])  # Max 16 samples  
-                    create_image_grid(neg_samples.cpu(), nrow=4, save_path=neg_grid_path)
-        
-        # Clear batch data from memory
-        del noise_batch, image_batch
+        # Clean up memory
+        del z0_batch, z1_batch, z1_tensor
         torch.cuda.empty_cache()
+        
+        if batch_num % 10 == 0:
+            gc.collect()
     
-    # Save file paths index for reconstruction
+    # Save file index
     file_index_path = os.path.join(pt_semantic_dir, 'batch_files_index.pkl')
     file_index = {
         'noise_files': all_noise_files,
@@ -883,10 +607,7 @@ def generate_semantic_data_pairs(config,
     with open(file_index_path, 'wb') as f:
         pickle.dump(file_index, f)
     
-    logging.info(f"Saved batch files index to {file_index_path}")
-    logging.info(f"Classification completed: {positive_count} positive samples, {negative_count} negative samples")
-    
-    # Save classification summary without loading all data
+    # Save classification summary
     classification_summary = {
         'num_positive': positive_count,
         'num_negative': negative_count,
@@ -898,189 +619,11 @@ def generate_semantic_data_pairs(config,
     with open(summary_path, 'w') as f:
         json.dump(classification_summary, f, indent=2)
     
+    logging.info(f"Classification completed: {positive_count} positive, {negative_count} negative")
     logging.info(f"Saved classification summary to {summary_path}")
     
     return classification_dir
 
-
-def continue_semantic_classification(config, workdir: str, interfacegan_model_path: str, 
-                                   existing_data_path: str) -> str:
-    """
-    Continue semantic classification from existing generated data - memory optimized
-    """
-    logging.info("Starting classification from existing data...")
-    
-    # Load existing data
-    data_dict = torch.load(existing_data_path, map_location='cpu')
-    z0_data = data_dict['z0']  # noise vectors
-    z1_data = data_dict['z1']  # generated images
-    
-    # Create minimal directories
-    semantic_dir = os.path.join(workdir, 'semantic_analysis')
-    boundary_dir = os.path.join(semantic_dir, 'boundaries')
-    os.makedirs(boundary_dir, exist_ok=True)
-    
-    # Initialize semantic trainer
-    semantic_trainer = SemanticBoundaryTrainer(
-        interfacegan_model_path=interfacegan_model_path,
-        device=config.device
-    )
-    
-    # Convert data format
-    if isinstance(z1_data, np.ndarray):
-        z1_tensor = torch.from_numpy(z1_data)
-    else:
-        z1_tensor = z1_data
-    
-    if isinstance(z0_data, np.ndarray):
-        z0_tensor = torch.from_numpy(z0_data)
-    else:
-        z0_tensor = z0_data
-    
-    # Normalize images for classification
-    if z1_tensor.min() < 0:
-        z1_tensor = (z1_tensor + 1.0) / 2.0
-    elif z1_tensor.max() > 1.0:
-        z1_tensor = z1_tensor / 255.0
-    
-    # Process in batches - collect labels and probabilities
-    all_labels = []
-    all_probabilities = []
-    batch_size = config.semantic.semantic_batch_size
-    
-    for i in tqdm(range(0, len(z0_tensor), batch_size), desc="Classifying"):
-        end_idx = min(i + batch_size, len(z0_tensor))
-        image_batch = z1_tensor[i:end_idx].to(config.device)
-        
-        # Classify with probabilities (debug for first batch only)
-        labels, probabilities = semantic_trainer.classify_images(image_batch, debug=(i == 0), return_probabilities=True)
-        all_labels.extend(labels)
-        all_probabilities.extend(probabilities)
-        
-        # Clear GPU memory
-        del image_batch
-        torch.cuda.empty_cache()
-    
-    all_labels = np.array(all_labels)
-    positive_count = np.sum(all_labels == 1)
-    negative_count = np.sum(all_labels == 0)
-    
-    logging.info(f"Classification done: {positive_count} positive, {negative_count} negative")
-    
-    # Save some sample images for inspection
-    sample_dir = os.path.join(semantic_dir, 'sample_results')
-    os.makedirs(sample_dir, exist_ok=True)
-    
-    # Find indices for positive and negative samples
-    positive_indices = np.where(all_labels == 1)[0]
-    negative_indices = np.where(all_labels == 0)[0]
-    
-    # Save some positive samples
-    if len(positive_indices) > 0:
-        pos_samples_to_save = min(8, len(positive_indices))
-        logging.info(f"Saving {pos_samples_to_save} positive (smile) samples for inspection...")
-        for i in range(pos_samples_to_save):
-            idx = positive_indices[i]
-            img = z1_tensor[idx].cpu()
-            
-            # Use the same normalization as create_image_grid for consistency
-            min_val = img.min().item()
-            max_val = img.max().item()
-            logging.debug(f"Positive sample {i+1} - min: {min_val:.3f}, max: {max_val:.3f}")
-            
-            # Only normalize if in [-1,1] range (same logic as create_image_grid)
-            if min_val < -0.5:  # Likely in [-1,1] range
-                img_normalized = (img + 1.0) / 2.0
-            else:
-                img_normalized = img
-            img_normalized = torch.clamp(img_normalized, 0, 1)
-            
-            # Convert to PIL and save
-            img_np = img_normalized.permute(1, 2, 0).numpy()
-            img_np = np.clip(img_np * 255.0, 0, 255).astype(np.uint8)
-            img_pil = Image.fromarray(img_np)
-            
-            img_path = os.path.join(sample_dir, f'positive_sample_{i+1}.png')
-            img_pil.save(img_path)
-        
-        logging.info(f"Positive samples saved to: {sample_dir}/positive_sample_*.png")
-    
-    # Save some negative samples  
-    if len(negative_indices) > 0:
-        neg_samples_to_save = min(8, len(negative_indices))
-        logging.info(f"Saving {neg_samples_to_save} negative (no smile) samples for inspection...")
-        for i in range(neg_samples_to_save):
-            idx = negative_indices[i]
-            img = z1_tensor[idx].cpu()
-            
-            # Use the same normalization as create_image_grid for consistency
-            min_val = img.min().item()
-            max_val = img.max().item()
-            logging.debug(f"Negative sample {i+1} - min: {min_val:.3f}, max: {max_val:.3f}")
-            
-            # Only normalize if in [-1,1] range (same logic as create_image_grid)
-            if min_val < -0.5:  # Likely in [-1,1] range
-                img_normalized = (img + 1.0) / 2.0
-            else:
-                img_normalized = img
-            img_normalized = torch.clamp(img_normalized, 0, 1)
-            
-            # Convert to PIL and save
-            img_np = img_normalized.permute(1, 2, 0).numpy()
-            img_np = np.clip(img_np * 255.0, 0, 255).astype(np.uint8)
-            img_pil = Image.fromarray(img_np)
-            
-            img_path = os.path.join(sample_dir, f'negative_sample_{i+1}.png')
-            img_pil.save(img_path)
-        
-        logging.info(f"Negative samples saved to: {sample_dir}/negative_sample_*.png")
-    
-    # Convert to numpy for boundary training
-    z0_numpy = z0_tensor.numpy() if torch.is_tensor(z0_tensor) else z0_tensor
-    z1_numpy = z1_tensor.numpy() if torch.is_tensor(z1_tensor) else z1_tensor
-    
-    # Flatten noise vectors for SVM training (4D -> 2D)
-    # Shape: (batch, channels, height, width) -> (batch, channels*height*width)
-    if len(z0_numpy.shape) == 4:
-        z0_flattened = z0_numpy.reshape(z0_numpy.shape[0], -1)
-        logging.info(f"Flattened noise vectors from {z0_numpy.shape} to {z0_flattened.shape}")
-    else:
-        z0_flattened = z0_numpy
-    
-    # Train boundary
-    logging.info("Training boundary...")
-    boundary, svm_accuracy = semantic_trainer.train_boundary(
-        noise_vectors=z0_flattened,
-        labels=all_labels,
-        save_path=os.path.join(boundary_dir, 'semantic_boundary.pkl')
-    )
-    
-    # Save final results
-    semantic_data_path = os.path.join(workdir, 'semantic_data_pairs.pkl')
-    semantic_data = {
-        'z0': z0_numpy,
-        'z1': z1_numpy,
-        'labels': all_labels,
-        'probabilities': all_probabilities,
-        'boundary': boundary,
-        'config': config,
-        'metadata': {
-            'num_samples': len(all_labels),
-            'positive_ratio': positive_count / len(all_labels),
-            'svm_accuracy': svm_accuracy
-        }
-    }
-    
-    with open(semantic_data_path, 'wb') as f:
-        pickle.dump(semantic_data, f)
-    
-    logging.info(f"Done! Accuracy: {svm_accuracy:.3f}, saved to: {semantic_data_path}")
-    
-    # Clean up
-    del z0_tensor, z1_tensor, z0_numpy, z1_numpy
-    torch.cuda.empty_cache()
-    
-    return semantic_data_path
 
 def train_reflow_with_uspace_drift(config, workdir, z0_data, z1_data, labels, boundary_vector, probabilities=None):
     """
@@ -1202,62 +745,6 @@ def train_reflow_with_uspace_drift(config, workdir, z0_data, z1_data, labels, bo
         raise
     
     logging.info("U-space drift reflow training completed!")
-    logging.info(f"Model checkpoints saved in: {training_checkpoint_dir}")
-    
-    return training_checkpoint_dir
-
-def train_reflow_with_semantic_control(config, workdir, z0_data, z1_original, z1_controlled, labels):
-    """
-    Train reflow model using both original and semantic-controlled trajectories
-    """
-    logging.info("Training reflow with semantic-controlled trajectories...")
-    
-    # Create checkpoint directory for training
-    training_checkpoint_dir = os.path.join(workdir, 'semantic_training', 'checkpoints')
-    os.makedirs(training_checkpoint_dir, exist_ok=True)
-    
-    # Update workdir to point to semantic_training so checkpoints are saved there
-    semantic_training_workdir = os.path.join(workdir, 'semantic_training')
-    os.makedirs(semantic_training_workdir, exist_ok=True)
-    
-    # Combine original and controlled data for training
-    # Use both original trajectories and controlled trajectories
-    combined_z0 = np.concatenate([z0_data, z0_data], axis=0)  # Same noise, different targets
-    combined_z1 = np.concatenate([z1_original, z1_controlled], axis=0)  # Original + controlled
-    combined_labels = np.concatenate([labels, labels], axis=0)  # Same labels
-    
-    # Create training data dictionary
-    training_data = {
-        'noise': combined_z0,
-        'data': combined_z1,
-        'labels': combined_labels,
-        'metadata': {
-            'original_samples': len(z0_data),
-            'controlled_samples': len(z1_controlled),
-            'total_samples': len(combined_z0)
-        }
-    }
-    
-    # Save training data
-    training_data_path = os.path.join(semantic_training_workdir, 'semantic_controlled_training_data.pkl')
-    with open(training_data_path, 'wb') as f:
-        pickle.dump(training_data, f)
-    
-    logging.info(f"Saved semantic-controlled training data to {training_data_path}")
-    logging.info(f"Training data: {len(combined_z0)} total samples ({len(z0_data)} original + {len(z1_controlled)} controlled)")
-    
-    # Update config to use the new training data
-    config.data.dataset = 'CUSTOM'
-    config.data.data_path = training_data_path
-    
-    try:
-        # Use the existing finetune_reflow function with modified workdir
-        run_lib_reflow.finetune_reflow(config, semantic_training_workdir)
-    except Exception as e:
-        logging.error(f"Training failed: {e}")
-        raise
-    
-    logging.info("Semantic-controlled reflow training completed!")
     logging.info(f"Model checkpoints saved in: {training_checkpoint_dir}")
     
     return training_checkpoint_dir
@@ -1500,31 +987,3 @@ def train_semantic_reflow(config, workdir: str, semantic_data_path: str):
     
     # Return the checkpoint directory so caller can find the latest checkpoint
     return checkpoint_dir
-
-def finetune_semantic_reflow(config, workdir: str, interfacegan_model_path: str):
-    """
-    Main function to run semantic-aware reflow training
-    """
-    logging.info("Starting semantic-aware reflow training pipeline...")
-    
-    # Initialize WandB logging
-    setup_wandb(config, workdir)
-    
-    # Step 1: Generate semantic data pairs
-    num_samples = getattr(config.semantic, 'num_semantic_samples', 50000)  # Use the new config name
-    logging.info(f"Will generate {num_samples} semantic data pairs with {config.sampling.sample_N} sampling steps")
-    
-    semantic_data_path = generate_semantic_data_pairs(
-        config=config,
-        workdir=workdir,
-        interfacegan_model_path=interfacegan_model_path,
-        num_samples=num_samples
-    )
-    
-    # Step 2: Train semantic reflow
-    train_semantic_reflow(config, workdir, semantic_data_path)
-    
-    logging.info("Semantic-aware reflow training completed!")
-    
-    # Finish WandB run
-    wandb.finish()

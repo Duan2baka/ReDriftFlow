@@ -102,7 +102,7 @@ def get_config():
     # Semantic configuration for iterative training
     config.semantic = semantic = ml_collections.ConfigDict()
     semantic.semantic_batch_size = 4  # Memory-safe batch size
-    semantic.num_semantic_samples = 1000  # Fast testing with 1000 images
+    semantic.num_semantic_samples = 10000  # Fast testing with 1000 images
     semantic.interfacegan_model_path = "/home/felix/restyle-encoder/interfacegan_trained_model/model_smiling.pth"
     semantic.boundary_path = ""  # Will be set during training
     semantic.control_time = 0.2  # U-Space control at t=0.2
