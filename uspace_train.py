@@ -123,10 +123,17 @@ def setup_logging(workdir):
         format='%(asctime)s - %(levelname)s - %(message)s',
         handlers=[
             logging.FileHandler(log_file),
-            logging.StreamHandler()
-        ]
+            logging.StreamHandler(sys.stdout)
+        ],
+        force=True
     )
+    
+    for handler in logging.getLogger().handlers:
+        if isinstance(handler, logging.StreamHandler):
+            handler.stream.flush()
+    
     return log_file
+
 
 def setup_wandb(config, workdir, experiment_name):
     """Setup WandB logging"""

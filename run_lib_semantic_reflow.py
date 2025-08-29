@@ -622,7 +622,7 @@ def generate_semantic_data_pairs(config,
     logging.info(f"Classification completed: {positive_count} positive, {negative_count} negative")
     logging.info(f"Saved classification summary to {summary_path}")
     
-    return classification_dir
+    return pt_semantic_dir
 
 
 def train_reflow_with_uspace_drift(config, workdir, z0_data, z1_data, labels, boundary_vector, probabilities=None):

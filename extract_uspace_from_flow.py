@@ -263,7 +263,7 @@ class USpaceExtractor:
         Returns:
             List of U-Space data arrays, one for each time point
         """
-        logging.info(f"Extracting U-Space for {len(time_points)} time points simultaneously...")
+        #logging.info(f"Extracting U-Space for {len(time_points)} time points simultaneously...")
         #print(f"Extracting U-Space for {len(time_points)} time points simultaneously...")
         
         if self.score_model is None:
@@ -336,7 +336,7 @@ class USpaceExtractor:
             else:
                 final_results.append(np.array([], dtype=np.float32))
         
-        logging.info(f"Extracted U-Space for {len(time_points)} time points, shapes: {[r.shape for r in final_results]}")
+        #logging.info(f"Extracted U-Space for {len(time_points)} time points, shapes: {[r.shape for r in final_results]}")
         return final_results
 
     def process(self, data_path: str, output_dir: str,
@@ -378,7 +378,7 @@ class USpaceExtractor:
         
         logging.info(f"Found {len(data_files)} data files to process")
         
-        batch_size = 4 
+        batch_size = 2
         total_samples = 0
         uspace_results = {t: [] for t in time_points} 
         
@@ -416,18 +416,26 @@ class USpaceExtractor:
                 continue
             
             z0_batch = torch.cat(z0_batch_list, dim=0)
-            
-            logging.info(f"Batch contains {len(z0_batch)} samples")
+            if batch_num == 1:
+                tqdm.write(f"Batch {batch_num} contains {len(z0_batch)} samples")
+                tqdm.write(f"Processing batch {batch_num} for time points: {time_points}")
+                tqdm.write(f"Batch {batch_num} - Extracted U-Space shapes: {[r.shape for r in batch_uspace_results]}")
             total_samples += len(z0_batch)
             
             # Process this batch for all time points together
-            logging.info(f"Processing batch for all time points: {time_points}")
+
+            #logging.info(f"Batch contains {len(z0_batch)} samples")
+            total_samples += len(z0_batch)
+            
+            # Process this batch for all time points together
+            #logging.info(f"Processing batch for all time points: {time_points}")
             
             # Extract U-Space for all time points in one go
             batch_uspace_results = self.extract_uspace(
                 z0_batch.numpy(), time_points
             )
-            
+
+
             # Save results for each time point
             for i, t in enumerate(time_points):
                 final_file = os.path.join(output_dir, f'batch_{batch_start//batch_size + 1}_uspace_t_{t:.2f}.npy')
