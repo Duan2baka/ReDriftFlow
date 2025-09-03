@@ -6,13 +6,13 @@ This pipeline implements complete U-Space aware training with mathematical contr
 u' = u + k * v_t
 
 Where:
-- u: original U-Space representation extracted at t=0.2
+- u: original U-Space representation extracted at t=0.5
 - k: semantic classifier prediction strength  
 - v_t: semantic boundary vector in U-Space
 
 The pipeline performs iterative training where each iteration:
 1. Generates semantic data pairs using current model
-2. Extracts U-Space representations at t=0.2
+2. Extracts U-Space representations at t=0.5
 3. Trains semantic boundary in U-Space using SVM
 4. Trains reflow model with U-Space control (u' = u + k * v_t)
 5. Uses improved model for next iteration
@@ -226,8 +226,12 @@ def run_single_iteration(config, workdir, iteration, base_model_path):
             pt_files = [f for f in os.listdir(pt_files_dir) 
                        if f.endswith('.pt') or f.endswith('.pkl')]
             if pt_files:
-                # Use pt_files directory as the semantic data path
-                semantic_data_path = pt_files_dir
+                # Look for main semantic data file, fallback to directory if needed
+                main_file = os.path.join(pt_files_dir, 'batch_files_index.pkl')
+                if os.path.exists(main_file):
+                    semantic_data_path = main_file
+                else:
+                    semantic_data_path = pt_files_dir
                 semantic_data_found = True
                 logging.info(f"Found existing semantic data in pt_files: {semantic_data_path}")
                 print(f"Found existing semantic data in pt_files: {semantic_data_path}")
@@ -288,11 +292,11 @@ def run_single_iteration(config, workdir, iteration, base_model_path):
             raise
 
 
-    # Step 2: Extract U-Space representations at t=0.2 
+    # Step 2: Extract U-Space representations at t=0.5 
     logging.info("Step 2: Checking for existing U-Space representations...")
     print("Step 2: Checking for existing U-Space representations...")
-    uspace_dir = os.path.join(iteration_dir, 'uspace_extracted')
-    control_time = getattr(config, 'semantic', {}).get('control_time', 0.2)
+    control_time = getattr(config, 'semantic', {}).get('control_time', 0.5)
+    uspace_dir = os.path.join(iteration_dir, 'uspace_extracted', f't_{control_time:.2f}')
     uspace_file = os.path.join(uspace_dir, f'uspace_t_{control_time:.2f}.npy')
     
     uspace_exists = False
@@ -319,16 +323,24 @@ def run_single_iteration(config, workdir, iteration, base_model_path):
             existing_uspace_files = glob.glob(os.path.join(uspace_dir, 'uspace_t_*.npy'))
             if existing_uspace_files:
                 logging.info(f"Found existing U-Space files: {existing_uspace_files}")
-                # Use the first available file
-                uspace_file = existing_uspace_files[0]
-                try:
-                    test_data = np.load(uspace_file, allow_pickle=True)
-                    if len(test_data) > 0:
-                        uspace_exists = True
-                        logging.info(f"Using existing U-Space data: {uspace_file}")
-                        logging.info(f"U-Space data shape: {test_data.shape}")
-                except Exception as e:
-                    logging.warning(f"Cannot load existing U-Space file {uspace_file}: {e}")
+                # Only use file if it matches the current control_time
+                target_filename = f'uspace_t_{control_time:.2f}.npy'
+                matching_file = None
+                for file_path in existing_uspace_files:
+                    if os.path.basename(file_path) == target_filename:
+                        matching_file = file_path
+                        break
+                
+                if matching_file:
+                    uspace_file = matching_file
+                    try:
+                        test_data = np.load(uspace_file, allow_pickle=True)
+                        if len(test_data) > 0:
+                            uspace_exists = True
+                            logging.info(f"Using existing U-Space data: {uspace_file}")
+                            logging.info(f"U-Space data shape: {test_data.shape}")
+                    except Exception as e:
+                        logging.warning(f"Cannot load existing U-Space file {uspace_file}: {e}")
     
     if not uspace_exists:
         # Extract new U-Space representations

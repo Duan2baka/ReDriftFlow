@@ -105,7 +105,7 @@ def get_config():
     semantic.num_semantic_samples = 10000  # Fast testing with 1000 images
     semantic.interfacegan_model_path = "/home/felix/restyle-encoder/interfacegan_trained_model/model_smiling.pth"
     semantic.boundary_path = ""  # Will be set during training
-    semantic.control_time = 0.2  # U-Space control at t=0.2
+    semantic.control_time = 0.5  # U-Space control at t=0.5
     
     # Optimization
     config.optim = optim = ml_collections.ConfigDict()

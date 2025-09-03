@@ -295,10 +295,14 @@ class SemanticBoundaryTrainer:
         # Use SGDClassifier for incremental learning (approximates SVM with hinge loss)
         svm_model = SGDClassifier(
             loss='hinge',  # SVM-like loss
-            learning_rate='constant',
-            eta0=0.001,
+            learning_rate='adaptive', 
+            eta0=0.01,  # 增加初始学习率
             random_state=42,
-            max_iter=1
+            max_iter=10000,  # 增加最大迭代次数
+            tol=1e-3,  # 设置收敛容忍度
+            n_iter_no_change=10,  # 早停参数
+            early_stopping=True,
+            validation_fraction=0.1
         )
         
         # Split data for validation - use smaller validation set
@@ -489,20 +493,21 @@ class SemanticBoundaryTrainer:
         """
         logging.info(f"Training semantic boundary in U-Space for iteration {iteration}...")
         
-        # Load U-Space data for the control time (t=0.2)
-        control_time = 0.2  # Default control time
-        uspace_file = os.path.join(uspace_dir, f'uspace_t_{control_time:.2f}.npy')
+        # Load U-Space data - detect correct control time from config or file structure
+        uspace_file = None
         
-        if not os.path.exists(uspace_file):
-            logging.error(f"U-Space file not found: {uspace_file}")
-            # Try to find any available uspace file
-            import glob
-            available_files = glob.glob(os.path.join(uspace_dir, 'uspace_t_*.npy'))
-            if available_files:
-                uspace_file = available_files[0]
-                logging.info(f"Using available U-Space file: {uspace_file}")
-            else:
-                raise FileNotFoundError(f"No U-Space files found in {uspace_dir}")
+        # First try to find any uspace file in the directory
+        import glob
+        available_files = glob.glob(os.path.join(uspace_dir, 'uspace_t_*.npy'))
+        
+        if available_files:
+            uspace_file = available_files[0]
+            logging.info(f"Using available U-Space file: {uspace_file}")
+            # Extract control_time from filename
+            filename = os.path.basename(uspace_file)
+            control_time = float(filename.split('_t_')[1].split('.npy')[0])
+        else:
+            raise FileNotFoundError(f"No U-Space files found in {uspace_dir}")
         
         # Load U-Space data
         logging.info(f"Loading U-Space data from: {uspace_file}")
@@ -510,28 +515,39 @@ class SemanticBoundaryTrainer:
         logging.info(f"Loaded U-Space data shape: {uspace_data.shape}")
         
         # We need to get the corresponding labels for these U-Space features
-        # Load semantic data to get labels
-        semantic_files = []
-        parent_dir = os.path.dirname(uspace_dir)
+        # Load semantic data to get labels from the iteration directory
+        # uspace_dir is like: workdir/debug_run/iteration_1/uspace_extracted/t_0.50
+        # We need to go up to: workdir/debug_run/iteration_1
+        iteration_dir = os.path.dirname(os.path.dirname(uspace_dir))
+
+        labels = None
+        # First try to load from batch_files_index.pkl which should contain real labels
+        index_path = os.path.join(iteration_dir, 'semantic_analysis', 'pt_files', 'batch_files_index.pkl')
         
-        # Look for semantic data files in the parent directory
-        import glob
-        semantic_pattern = os.path.join(parent_dir, '**/semantic_data_classified/**/*.pt')
-        semantic_files = glob.glob(semantic_pattern, recursive=True)
+        if os.path.exists(index_path):
+            try:
+                with open(index_path, 'rb') as f:
+                    file_index = pickle.load(f)
+                labels = np.array(file_index['labels'])
+                logging.info(f"Successfully loaded {len(labels)} labels from batch_files_index.pkl")
+            except Exception as e:
+                logging.warning(f"Error loading from batch_files_index.pkl: {e}")
         
-        if not semantic_files:
-            # Try alternative pattern
-            semantic_pattern = os.path.join(parent_dir, 'semantic_data_classified/**/*.pt')
-            semantic_files = glob.glob(semantic_pattern, recursive=True)
+        if labels is None:
+            # Look for probabilities files in pt_files directory which contain real classification results
+            pt_files_dir = os.path.join(iteration_dir, 'semantic_analysis', 'pt_files')
+            if os.path.exists(pt_files_dir):
+                import glob
+                prob_files = glob.glob(os.path.join(pt_files_dir, 'probabilities_batch_*.pt'))
+                if prob_files:
+                    logging.info(f"Found {len(prob_files)} probability files, loading real semantic labels...")
+                    labels = self._load_labels_from_probability_files(prob_files, len(uspace_data))
         
-        if not semantic_files:
-            logging.warning("No semantic classification files found, generating dummy labels for testing")
-            # Generate dummy labels for testing
-            num_samples = len(uspace_data)
-            labels = np.random.randint(0, 2, num_samples)
-        else:
-            # Load and combine labels from semantic classification
-            labels = self._load_labels_from_semantic_files(semantic_files, len(uspace_data))
+        if labels is None:
+            raise FileNotFoundError(
+                f"No semantic classification labels found. Checked: {index_path} and pt_files directory. "
+                "Cannot train semantic boundary without real labels."
+            )
         
         logging.info(f"Using {len(labels)} labels for U-Space boundary training")
         logging.info(f"Label distribution: Positive: {np.sum(labels == 1)}, Negative: {np.sum(labels == 0)}")
@@ -561,6 +577,32 @@ class SemanticBoundaryTrainer:
         logging.info(f"TRUE U-Space boundary training completed with accuracy: {svm_accuracy:.3f}")
         return boundary_info
     
+    def _load_labels_from_probability_files(self, prob_files: List[str], expected_count: int) -> np.ndarray:
+        """Load labels from probability files by converting probabilities to binary labels"""
+        all_probabilities = []
+        
+        for file_path in sorted(prob_files):
+            try:
+                data = torch.load(file_path, map_location='cpu')
+                if isinstance(data, torch.Tensor):
+                    all_probabilities.extend(data.numpy())
+                elif isinstance(data, np.ndarray):
+                    all_probabilities.extend(data)
+                elif isinstance(data, list):
+                    all_probabilities.extend(data)
+            except Exception as e:
+                logging.warning(f"Failed to load probabilities from {file_path}: {e}")
+                continue
+        
+        if len(all_probabilities) >= expected_count:
+            # Convert probabilities to binary labels (threshold at 0.5)
+            probabilities = np.array(all_probabilities[:expected_count])
+            labels = (probabilities > 0.5).astype(int)
+            logging.info(f"Converted {len(labels)} probabilities to binary labels")
+            return labels
+        else:
+            raise ValueError(f"Only found {len(all_probabilities)} probabilities, expected {expected_count}")
+
     def _load_labels_from_semantic_files(self, semantic_files: List[str], expected_count: int) -> np.ndarray:
         """Load labels from semantic classification files"""
         all_labels = []

@@ -346,16 +346,17 @@ class USpaceExtractor:
         logging.info(f"Processing existing data pairs from: {data_path} (memory-efficient)")
         
         if iteration is not None:
-            output_dir = os.path.join(output_dir, f'iteration_{iteration}', 'uspace_extracted')
+            base_output_dir = os.path.join(output_dir, f'iteration_{iteration}', 'uspace_extracted')
+        else:
+            base_output_dir = output_dir
         if time_points is None:
             time_points = [0.1, 0.2, 0.3, 0.5]
-        os.makedirs(output_dir, exist_ok=True)
         if checkpoint_path is None:
             raise ValueError("checkpoint_path required")
         self.load_model(checkpoint_path)
         
         if os.path.isdir(data_path):
-            summary_file = self.process_batch(data_path, output_dir, time_points)
+            summary_file = self.process_batch(data_path, base_output_dir, time_points)
         else:
             print("Data path is not a directory")
             
@@ -375,6 +376,9 @@ class USpaceExtractor:
         
         if not data_files:
             raise ValueError(f"No .pt or .pkl files found in directory: {data_path}")
+        
+        # Sort files by batch number to match label order
+        data_files.sort(key=lambda x: int(os.path.basename(x).split('_batch_')[1].split('.pt')[0]))
         
         logging.info(f"Found {len(data_files)} data files to process")
         
@@ -436,9 +440,11 @@ class USpaceExtractor:
                 tqdm.write(f"Batch {batch_num} - Extracted U-Space shapes: {[r.shape for r in batch_uspace_results]}")
 
 
-            # Save results for each time point
+            # Save results for each time point in separate folders
             for i, t in enumerate(time_points):
-                final_file = os.path.join(output_dir, f'batch_{batch_start//batch_size + 1}_uspace_t_{t:.2f}.npy')
+                t_output_dir = os.path.join(output_dir, f't_{t:.2f}')
+                os.makedirs(t_output_dir, exist_ok=True)
+                final_file = os.path.join(t_output_dir, f'batch_{batch_start//batch_size + 1}_uspace_t_{t:.2f}.npy')
                 np.save(final_file, batch_uspace_results[i])
                 uspace_results[t].append(final_file)
             
@@ -451,7 +457,8 @@ class USpaceExtractor:
         logging.info(f"Combining batch results for {len(time_points)} time points...")
         for t in time_points:
             if uspace_results[t]:
-                combined_file = os.path.join(output_dir, f'uspace_t_{t:.2f}.npy')
+                t_output_dir = os.path.join(output_dir, f't_{t:.2f}')
+                combined_file = os.path.join(t_output_dir, f'uspace_t_{t:.2f}.npy')
                 self._combine_batch_files(uspace_results[t], combined_file)
                 uspace_results[t] = combined_file
         
@@ -513,7 +520,7 @@ def main():
                        help='Time points to extract (e.g., 0.1 0.25 0.5)')
     parser.add_argument('--checkpoint_path', type=str,
                        help='Path to model checkpoint')
-    parser.add_argument('--control_time', type=float, default=0.25,
+    parser.add_argument('--control_time', type=float, default=0.5,
                        help='Main control time point')
     parser.add_argument('--iteration', type=int,
                        help='Iteration number for organizing outputs in iteration subdirectories')
